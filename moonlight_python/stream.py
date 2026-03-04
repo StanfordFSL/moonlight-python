@@ -11,6 +11,7 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
@@ -20,6 +21,7 @@ import numpy as np
 from .config import StreamConfig
 from .decoder import Decoder
 from .exceptions import StreamStartError, StreamTerminatedError
+from .frame import Frame
 
 # CFFI definitions matching Limelight.h
 CDEF = """
@@ -150,10 +152,24 @@ DR_OK = 0
 DR_NEED_IDR = -1
 
 # Encryption flags
-ENCFLG_ALL = 0xFFFFFFFF
+ENCFLG_ALL = -1  # 0xFFFFFFFF as signed int32
 
 # Audio config: stereo
 AUDIO_CONFIGURATION_STEREO = (0x3 << 16) | (2 << 8) | 0xCA
+
+
+@dataclass(slots=True)
+class RawFrame:
+    """Raw frame data with metadata extracted from DECODE_UNIT."""
+
+    annex_b_data: bytes
+    frame_number: int
+    frame_type: int
+    timestamp_us: int
+    receive_time_us: int
+    enqueue_time_us: int
+    rtp_timestamp: int
+    host_processing_latency_us: int
 
 
 def _find_shared_lib() -> str:
@@ -345,11 +361,11 @@ class StreamingSession:
             return ""
         return self._ffi.string(result).decode("utf-8")
 
-    def pull_frame(self) -> tuple[bytes, int] | None:
+    def pull_frame(self) -> RawFrame | None:
         """Pull the next video frame (blocking).
 
         Returns:
-            Tuple of (annex_b_data, frame_type) or None if terminated.
+            RawFrame with Annex B data and metadata, or None if terminated.
         """
         if not self._connected:
             return None
@@ -364,7 +380,6 @@ class StreamingSession:
             return None
 
         du = decode_unit[0]
-        frame_type = du.frameType
 
         # Walk the buffer linked list and concatenate data
         data = bytearray()
@@ -374,10 +389,21 @@ class StreamingSession:
             data.extend(chunk)
             entry = entry.next
 
+        raw = RawFrame(
+            annex_b_data=bytes(data),
+            frame_number=du.frameNumber,
+            frame_type=du.frameType,
+            timestamp_us=du.presentationTimeUs,
+            receive_time_us=du.receiveTimeUs,
+            enqueue_time_us=du.enqueueTimeUs,
+            rtp_timestamp=du.rtpTimestamp,
+            host_processing_latency_us=du.frameHostProcessingLatency,
+        )
+
         # Complete the frame
         self._lib.LiCompleteVideoFrame(frame_handle[0], DR_OK)
 
-        return bytes(data), frame_type
+        return raw
 
     def drain_frames(self) -> None:
         """Drain any pending frames without processing them."""
@@ -385,6 +411,10 @@ class StreamingSession:
         decode_unit = self._ffi.new("DECODE_UNIT**")
         while self._lib.LiPollNextVideoFrame(frame_handle, decode_unit):
             self._lib.LiCompleteVideoFrame(frame_handle[0], DR_OK)
+
+    def wake(self) -> None:
+        """Wake up LiWaitForNextVideoFrame() so a blocked pull thread can exit."""
+        self._lib.LiWakeWaitForVideoFrame()
 
     @property
     def is_connected(self) -> bool:
@@ -399,20 +429,20 @@ class StreamingSession:
         return self._termination_error_code
 
 
-def stream_frames(session: StreamingSession, decoder: Decoder) -> Iterator[np.ndarray]:
-    """Generator that yields decoded video frames as numpy arrays.
+def stream_frames(session: StreamingSession, decoder: Decoder) -> Iterator[Frame]:
+    """Generator that yields decoded video frames as Frame objects.
 
     Args:
         session: Active streaming session
         decoder: Video decoder instance
 
     Yields:
-        numpy arrays of shape (H, W, 3) dtype uint8 in BGR format
+        Frame objects containing decoded numpy array and metadata
     """
     try:
         while session.is_connected:
-            result = session.pull_frame()
-            if result is None:
+            raw = session.pull_frame()
+            if raw is None:
                 if session.is_terminated:
                     error = session.termination_error
                     if error != 0:
@@ -420,9 +450,17 @@ def stream_frames(session: StreamingSession, decoder: Decoder) -> Iterator[np.nd
                     return  # Graceful termination
                 continue
 
-            annex_b_data, frame_type = result
-            frames = decoder.decode(annex_b_data)
-            for frame in frames:
-                yield frame
+            decoded_frames = decoder.decode(raw.annex_b_data)
+            for arr in decoded_frames:
+                yield Frame(
+                    data=arr,
+                    frame_number=raw.frame_number,
+                    frame_type=raw.frame_type,
+                    timestamp_us=raw.timestamp_us,
+                    receive_time_us=raw.receive_time_us,
+                    enqueue_time_us=raw.enqueue_time_us,
+                    rtp_timestamp=raw.rtp_timestamp,
+                    host_processing_latency_us=raw.host_processing_latency_us,
+                )
     finally:
         session.stop()

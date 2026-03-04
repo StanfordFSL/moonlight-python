@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(moonlight-python-native LANGUAGES C CXX)
 
+include(CheckCXXSourceCompiles)
+
 # Build moonlight-common-c as a shared library
 set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 add_subdirectory(ext/moonlight-common-c)

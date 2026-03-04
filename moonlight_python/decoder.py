@@ -35,6 +35,13 @@ class Decoder:
         if codec_name is None:
             raise DecoderError(f"Unsupported codec: {codec}")
 
+        valid_formats = {"bgr24", "rgb24"}
+        if output_format not in valid_formats:
+            raise DecoderError(
+                f"Unsupported output_format: {output_format!r}. "
+                f"Must be one of: {', '.join(sorted(valid_formats))}"
+            )
+
         self._codec_ctx = av.CodecContext.create(codec_name, "r")
         self._codec_ctx.thread_type = "AUTO"
         self._codec_ctx.thread_count = 0  # auto

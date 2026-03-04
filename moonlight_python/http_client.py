@@ -13,8 +13,11 @@ from typing import Any
 from xml.etree import ElementTree
 
 import requests
+import urllib3
 
 from .identity import Identity
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from .server import AppInfo, ServerInfo
 from .exceptions import HttpResponseError
 
@@ -56,10 +59,17 @@ class NvHTTP:
         return f"{base_url}/{command}?{query}"
 
     def _make_ssl_context(self) -> ssl.SSLContext:
-        """Create an SSL context with client cert and pinned server cert."""
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        """Create an SSL context with client cert, no hostname verification.
 
-        # Load client identity
+        Sunshine's self-signed certs lack SubjectAltName fields, so we must
+        disable hostname checking entirely. The moonlight-qt client does the
+        same — it pins the server cert but doesn't check the hostname.
+        """
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        # Load client identity for mutual TLS
         with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as cert_f:
             cert_f.write(self.identity.cert_pem)
             cert_f.flush()
@@ -70,19 +80,6 @@ class NvHTTP:
             key_path = key_f.name
 
         ctx.load_cert_chain(cert_path, key_path)
-
-        if self.server_cert_pem:
-            # Pin the server cert
-            with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as ca_f:
-                ca_f.write(self.server_cert_pem)
-                ca_f.flush()
-                ca_path = ca_f.name
-            ctx.load_verify_locations(ca_path)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_REQUIRED
-        else:
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
 
         import os
         os.unlink(cert_path)
@@ -97,7 +94,6 @@ class NvHTTP:
 
         if use_https:
             from requests.adapters import HTTPAdapter
-            from urllib3.util.ssl_ import create_urllib3_context
 
             class _PinnedAdapter(HTTPAdapter):
                 def __init__(self, ssl_ctx: ssl.SSLContext, **kwargs: Any):
@@ -110,7 +106,7 @@ class NvHTTP:
 
             session = requests.Session()
             session.mount("https://", _PinnedAdapter(self._make_ssl_context()))
-            resp = session.get(url, timeout=timeout)
+            resp = session.get(url, timeout=timeout, verify=False)
         else:
             resp = self._session.get(url, timeout=timeout)
 

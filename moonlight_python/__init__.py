@@ -9,23 +9,25 @@ Usage::
     client = MoonlightClient()
     servers = client.discover()
     server = client.connect("192.168.1.X")
-    client.pair(server, pin="1234")
+    client.pair()
 
     for frame in client.stream(app="Desktop", width=1920, height=1080, fps=30):
-        # frame is numpy array (H, W, 3) uint8 BGR
-        result = my_cv_model(frame)
+        # frame.data is numpy array (H, W, 3) uint8 BGR
+        result = my_cv_model(frame.data)
 """
 
 from __future__ import annotations
 
 import atexit
-import os
+import random
 import secrets
+import time
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
 
+from .buffer import LatestFrameBuffer
 from .config import CODEC_MAP, StreamConfig, VIDEO_FORMAT_H264
 from .decoder import Decoder
 from .discovery import connect_to_server, discover_servers
@@ -35,9 +37,11 @@ from .exceptions import (
     PairingError,
     StreamingError,
 )
+from .frame import Frame
 from .http_client import NvHTTP
 from .identity import Identity
 from .pairing import pair as do_pair
+from .recorder import ImageRecorder, VideoRecorder
 from .server import AppInfo, ServerInfo
 from .stream import StreamingSession, stream_frames
 
@@ -46,6 +50,10 @@ __all__ = [
     "ServerInfo",
     "AppInfo",
     "StreamConfig",
+    "Frame",
+    "LatestFrameBuffer",
+    "ImageRecorder",
+    "VideoRecorder",
     "MoonlightError",
     "PairingError",
     "StreamingError",
@@ -99,17 +107,25 @@ class MoonlightClient:
         )
         return server
 
-    def pair(self, server: ServerInfo | None = None, pin: str = "0000") -> None:
-        """Pair with a server using the displayed PIN.
+    def pair(self, server: ServerInfo | None = None,
+             pin: str | None = None) -> None:
+        """Pair with a server.
 
         Args:
             server: ServerInfo to pair with (uses last connected if None)
-            pin: 4-digit PIN displayed on the server
+            pin: 4-digit PIN. If None, generates a random PIN and prints it
+                 for the user to enter in the Sunshine web UI.
         """
         if server is None:
             server = self._server
         if server is None:
             raise ConnectionError("Not connected to a server")
+
+        if pin is None:
+            pin = f"{random.randint(0, 9999):04d}"
+            print(f"PIN: {pin}")
+            print(f"Enter this PIN in the Sunshine web UI at "
+                  f"https://{server.address}:47990")
 
         http = NvHTTP(
             server.address, self._identity,
@@ -143,7 +159,8 @@ class MoonlightClient:
         return http.get_app_list()
 
     def stream(self, app: str = "Desktop", width: int = 1920, height: int = 1080,
-               fps: int = 30, bitrate_kbps: int = 10000, codec: str = "h264") -> Iterator[np.ndarray]:
+               fps: int = 30, bitrate_kbps: int = 10000, codec: str = "h264",
+               output_format: str = "bgr24") -> Iterator[Frame]:
         """Stream an application and yield decoded video frames.
 
         Args:
@@ -153,9 +170,122 @@ class MoonlightClient:
             fps: Frames per second
             bitrate_kbps: Bitrate in kbps
             codec: Video codec ("h264", "hevc", "av1")
+            output_format: Pixel format — "bgr24" (default) or "rgb24"
 
         Yields:
-            numpy arrays of shape (H, W, 3) dtype uint8 in BGR format
+            Frame objects with .data as numpy array (H, W, 3) uint8
+        """
+        session, decoder = self._setup_stream(
+            app, width, height, fps, bitrate_kbps, codec, output_format,
+        )
+
+        try:
+            yield from stream_frames(session, decoder)
+        finally:
+            self._stop_streaming()
+
+    def latest_frame(self, app: str = "Desktop", width: int = 1920,
+                     height: int = 1080, fps: int = 30,
+                     bitrate_kbps: int = 10000, codec: str = "h264",
+                     output_format: str = "bgr24") -> LatestFrameBuffer:
+        """Start streaming and return a LatestFrameBuffer context manager.
+
+        The buffer runs the stream in a background thread and always holds
+        the most recent frame, dropping older ones. Ideal for CV pipelines
+        that process at variable rates.
+
+        Usage::
+
+            with client.latest_frame(app="Desktop") as buf:
+                while True:
+                    frame = buf.get(timeout=1.0)
+                    if frame:
+                        result = my_model(frame.data)
+
+        Args:
+            app: Application name to stream (default "Desktop")
+            width: Video width in pixels
+            height: Video height in pixels
+            fps: Frames per second
+            bitrate_kbps: Bitrate in kbps
+            codec: Video codec ("h264", "hevc", "av1")
+            output_format: Pixel format — "bgr24" (default) or "rgb24"
+
+        Returns:
+            LatestFrameBuffer (use as context manager)
+        """
+        session, decoder = self._setup_stream(
+            app, width, height, fps, bitrate_kbps, codec, output_format,
+        )
+        return LatestFrameBuffer(session, decoder)
+
+    def record(self, output: str | Path, app: str = "Desktop",
+               width: int = 1920, height: int = 1080, fps: int = 30,
+               bitrate_kbps: int = 10000, codec: str = "h264",
+               duration: float | None = None,
+               max_frames: int | None = None) -> None:
+        """Record a stream to a video file or directory of images.
+
+        Auto-detects mode by the output path:
+        - File with video extension (.mp4, .mkv, .avi) → VideoRecorder
+        - Directory or path without video extension → ImageRecorder
+
+        Args:
+            output: Output file path or directory.
+            app: Application name to stream.
+            width: Video width in pixels.
+            height: Video height in pixels.
+            fps: Frames per second.
+            bitrate_kbps: Bitrate in kbps.
+            codec: Video codec ("h264", "hevc", "av1").
+            duration: Max recording duration in seconds (None = unlimited).
+            max_frames: Max number of frames to record (None = unlimited).
+        """
+        output_path = Path(output)
+        video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+        is_video = output_path.suffix.lower() in video_extensions
+
+        count = 0
+        start_time: float | None = None
+
+        if is_video:
+            with VideoRecorder(output_path, width, height, fps) as recorder:
+                for frame in self.stream(app, width, height, fps,
+                                         bitrate_kbps, codec):
+                    if start_time is None:
+                        start_time = time.monotonic()
+                    recorder.write(frame)
+                    count += 1
+                    if max_frames is not None and count >= max_frames:
+                        break
+                    if duration is not None and (time.monotonic() - start_time) >= duration:
+                        break
+        else:
+            with ImageRecorder(output_path) as recorder:
+                for frame in self.stream(app, width, height, fps,
+                                         bitrate_kbps, codec):
+                    if start_time is None:
+                        start_time = time.monotonic()
+                    recorder.write(frame)
+                    count += 1
+                    if max_frames is not None and count >= max_frames:
+                        break
+                    if duration is not None and (time.monotonic() - start_time) >= duration:
+                        break
+
+    def quit_app(self) -> None:
+        """Quit the currently running app on the server."""
+        http = self._get_http()
+        http.quit_app()
+
+    def _setup_stream(self, app: str, width: int, height: int, fps: int,
+                      bitrate_kbps: int, codec: str,
+                      output_format: str = "bgr24",
+                      ) -> tuple[StreamingSession, Decoder]:
+        """Set up a streaming session and decoder.
+
+        Returns:
+            (session, decoder) tuple ready for stream_frames().
         """
         http = self._get_http()
 
@@ -243,18 +373,10 @@ class MoonlightClient:
         self._session = session
 
         # Set up decoder
-        decoder = Decoder(codec=codec)
+        decoder = Decoder(codec=codec, output_format=output_format)
         self._decoder = decoder
 
-        try:
-            yield from stream_frames(session, decoder)
-        finally:
-            self._stop_streaming()
-
-    def quit_app(self) -> None:
-        """Quit the currently running app on the server."""
-        http = self._get_http()
-        http.quit_app()
+        return session, decoder
 
     def _get_http(self, server: ServerInfo | None = None) -> NvHTTP:
         if server is not None:

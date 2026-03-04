@@ -79,7 +79,8 @@ def _sign_data(identity: Identity, data: bytes) -> bytes:
     )
 
 
-def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) -> bytes:
+def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo,
+         timeout: int = 90) -> bytes:
     """Execute the 5-stage pairing protocol.
 
     Args:
@@ -87,6 +88,8 @@ def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) ->
         identity: Client identity (keypair + cert)
         pin: 4-digit PIN displayed on the server
         server_info: Server info (need app_version for hash algo selection)
+        timeout: Timeout per request in seconds (default 90, needs to be long
+                 because Sunshine blocks until the user enters the PIN)
 
     Returns:
         Server certificate PEM bytes (to be pinned for future HTTPS connections)
@@ -116,7 +119,8 @@ def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) ->
     get_cert_xml = http.open_http(
         "pair",
         f"devicename=roth&updateState=1&phrase=getservercert"
-        f"&salt={salt.hex()}&clientcert={identity.cert_pem.hex()}"
+        f"&salt={salt.hex()}&clientcert={identity.cert_pem.hex()}",
+        timeout=timeout,
     )
     NvHTTP.verify_response_status(get_cert_xml)
 
@@ -143,7 +147,8 @@ def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) ->
 
     challenge_xml = http.open_http(
         "pair",
-        f"devicename=roth&updateState=1&clientchallenge={encrypted_challenge.hex()}"
+        f"devicename=roth&updateState=1&clientchallenge={encrypted_challenge.hex()}",
+        timeout=timeout,
     )
     NvHTTP.verify_response_status(challenge_xml)
 
@@ -178,7 +183,8 @@ def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) ->
 
     resp_xml = http.open_http(
         "pair",
-        f"devicename=roth&updateState=1&serverchallengeresp={encrypted_response_hash.hex()}"
+        f"devicename=roth&updateState=1&serverchallengeresp={encrypted_response_hash.hex()}",
+        timeout=timeout,
     )
     NvHTTP.verify_response_status(resp_xml)
 
@@ -213,7 +219,8 @@ def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) ->
 
     secret_resp_xml = http.open_http(
         "pair",
-        f"devicename=roth&updateState=1&clientpairingsecret={client_pairing_secret.hex()}"
+        f"devicename=roth&updateState=1&clientpairingsecret={client_pairing_secret.hex()}",
+        timeout=timeout,
     )
     NvHTTP.verify_response_status(secret_resp_xml)
 
@@ -224,7 +231,8 @@ def pair(http: NvHTTP, identity: Identity, pin: str, server_info: ServerInfo) ->
     # --- Stage 5: Pair challenge over HTTPS ---
     pair_challenge_xml = http.open_https(
         "pair",
-        "devicename=roth&updateState=1&phrase=pairchallenge"
+        "devicename=roth&updateState=1&phrase=pairchallenge",
+        timeout=timeout,
     )
     NvHTTP.verify_response_status(pair_challenge_xml)
 

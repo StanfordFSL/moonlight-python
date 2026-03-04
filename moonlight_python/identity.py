@@ -60,7 +60,7 @@ class Identity:
             .subject_name(subject)
             .issuer_name(issuer)
             .public_key(self._private_key.public_key())
-            .serial_number(0)
+            .serial_number(1)  # C++ uses 0 but Python cryptography requires > 0
             .not_valid_before(now)
             .not_valid_after(now + timedelta(days=365 * 20))
             .sign(self._private_key, hashes.SHA256())

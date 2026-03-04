@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 name = "moonlight-python"
 version = "0.1.0"
 description = "Python client for Moonlight/Sunshine game streaming — receive decoded video frames as numpy arrays"
-readme = "README.md"
+readme = "PYPI_README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.10"
 dependencies = [

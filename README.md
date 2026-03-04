@@ -1,7 +1,7 @@
 # moonlight-python
 
 [![Tests](https://github.com/StanfordFSL/moonlight-python/actions/workflows/tests.yml/badge.svg)](https://github.com/StanfordFSL/moonlight-python/actions/workflows/tests.yml)
-[![PyPI](https://img.shields.io/pypi/v/moonlight-python)](https://pypi.org/project/moonlight-python/)
+[![PyPI](https://img.shields.io/pypi/v/moonlight-python?v=1)](https://pypi.org/project/moonlight-python/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 
 Python client for [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/) game streaming. Receives decoded video frames as numpy arrays for computer vision and robotics pipelines.

@@ -235,7 +235,3 @@ MoonlightClient (high-level API)
 ├── LatestFrameBuffer — Thread-safe latest-frame buffer
 └── ImageRecorder / VideoRecorder — Recording support
 ```
-
-## License
-
-GPL-3.0-or-later

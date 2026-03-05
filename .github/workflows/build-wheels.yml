@@ -24,8 +24,17 @@ jobs:
       - name: Install cibuildwheel
         run: pip install cibuildwheel
 
+      - name: Find OpenSSL (debug)
+        if: runner.os == 'Windows'
+        run: |
+          dir "C:\Program Files\OpenSSL"
+          dir "C:\Program Files\OpenSSL\include"
+          echo "OPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR"
+
       - name: Build wheels
         run: cibuildwheel --output-dir wheelhouse
+        env:
+          OPENSSL_ROOT_DIR: ${{ runner.os == 'Windows' && 'C:\Program Files\OpenSSL' || '' }}
 
       - uses: actions/upload-artifact@v4
         with:

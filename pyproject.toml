@@ -36,8 +36,27 @@ version_scheme = "guess-next-dev"
 local_scheme = "no-local-version"
 
 [tool.cibuildwheel]
-build = "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
-manylinux-x86_64-image = "manylinux_2_28"
-before-all = "yum install -y openssl-devel"
+build = [
+    "cp310-manylinux_x86_64", "cp311-manylinux_x86_64", "cp312-manylinux_x86_64", "cp313-manylinux_x86_64", "cp314-manylinux_x86_64",
+    "cp310-win_amd64", "cp311-win_amd64", "cp312-win_amd64", "cp313-win_amd64", "cp314-win_amd64",
+    "cp310-macosx_arm64", "cp311-macosx_arm64", "cp312-macosx_arm64", "cp313-macosx_arm64", "cp314-macosx_arm64",
+    "cp310-macosx_x86_64", "cp311-macosx_x86_64", "cp312-macosx_x86_64", "cp313-macosx_x86_64", "cp314-macosx_x86_64",
+]
 test-command = "pytest {project}/tests -v"
 test-requires = ["pytest"]
+
+[tool.cibuildwheel.linux]
+manylinux-x86_64-image = "manylinux_2_28"
+before-all = "yum install -y openssl-devel"
+
+[tool.cibuildwheel.macos]
+before-all = "brew install openssl@3"
+
+[tool.cibuildwheel.macos.environment]
+OPENSSL_ROOT_DIR = "/opt/homebrew/opt/openssl@3"
+
+[tool.cibuildwheel.windows]
+before-all = "choco install openssl"
+
+[tool.cibuildwheel.windows.environment]
+OPENSSL_ROOT_DIR = "C:\\Program Files\\OpenSSL-Win64"

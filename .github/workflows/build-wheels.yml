@@ -27,11 +27,8 @@ jobs:
       - name: Find OpenSSL (debug)
         if: runner.os == 'Windows'
         run: |
-          dir "C:\Program Files\OpenSSL"
-          dir "C:\Program Files\OpenSSL\include"
-          dir "C:\Program Files\OpenSSL\lib"
-          dir "C:\Program Files\OpenSSL\bin"
-          echo "OPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR"
+          echo "=== Searching for libcrypto-3-x64.dll ==="
+          Get-ChildItem -Path "C:\" -Filter "libcrypto-3-x64.dll" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { echo $_.FullName }
 
       - name: Build wheels
         run: cibuildwheel --output-dir wheelhouse

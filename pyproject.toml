@@ -58,3 +58,4 @@ MACOSX_DEPLOYMENT_TARGET = "15.0"
 
 [tool.cibuildwheel.windows.environment]
 OPENSSL_ROOT_DIR = "C:\\Program Files\\OpenSSL"
+SKBUILD_CMAKE_ARGS = "-DOPENSSL_ROOT_DIR=C:\\Program Files\\OpenSSL"

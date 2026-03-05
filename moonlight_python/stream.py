@@ -205,7 +205,12 @@ class StreamingSession:
     def __init__(self) -> None:
         self._ffi = cffi.FFI()
         self._ffi.cdef(CDEF)
-        self._lib = self._ffi.dlopen(_find_shared_lib())
+        lib_path = _find_shared_lib()
+        # On Windows, add the DLL's directory to the search path so that
+        # transitive dependencies (e.g. OpenSSL) next to it can be found.
+        if os.name == "nt":
+            os.add_dll_directory(str(Path(lib_path).parent))
+        self._lib = self._ffi.dlopen(lib_path)
 
         # Connection state
         self._connected = False

@@ -136,6 +136,7 @@ bool LiWaitForNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, DECODE_UNIT** deco
 bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, DECODE_UNIT** decodeUnit);
 void LiWakeWaitForVideoFrame(void);
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus);
+void LiRequestIdrFrame(void);
 """
 
 # Capability flags
@@ -416,6 +417,11 @@ class StreamingSession:
         decode_unit = self._ffi.new("DECODE_UNIT**")
         while self._lib.LiPollNextVideoFrame(frame_handle, decode_unit):
             self._lib.LiCompleteVideoFrame(frame_handle[0], DR_OK)
+
+    def request_idr(self) -> None:
+        """Request an IDR (keyframe) from the server."""
+        if self._connected:
+            self._lib.LiRequestIdrFrame()
 
     def wake(self) -> None:
         """Wake up LiWaitForNextVideoFrame() so a blocked pull thread can exit."""

@@ -125,7 +125,7 @@ for frame in client.stream(app="Desktop", width=1280, height=720, fps=30):
 
 ### Persistent Shared Stream
 
-By default, each call to `stream()`, `record()`, or `latest_frame()` creates its own RTSP connection. If you need multiple operations on the same stream (e.g., record while also reading frames), use `start_stream()` to establish a single persistent connection that all operations share.
+Use `start_stream()` to establish a single persistent connection. `record()` requires an active stream via `start_stream()`. `stream()` and `latest_frame()` can also tap into the shared connection when one is active.
 
 ```python
 client.connect("192.168.1.100")
@@ -151,8 +151,9 @@ client.stop_stream()
 `start_stream()` solves three problems compared to letting each method create its own connection:
 
 1. **No duplicate connections** — a second RTSP connection can disrupt an existing Sunshine session. With a shared stream, `record()` and `stream()` tap into the same connection.
-2. **Accurate recording duration** — `record()` starts its timer immediately since the stream is already warm, rather than losing seconds to connection setup.
+2. **Accurate recording duration** — recordings use wall-clock timestamps, so dropped frames create real time gaps rather than being silently compressed.
 3. **No black frames** — `start_stream()` waits for real (non-black) frames before returning, so consumers only see actual content.
+4. **Immediate frames** — an IDR frame is requested on start, so frames arrive immediately even when joining an existing Sunshine session.
 
 **`start_stream()` parameters:**
 
@@ -168,7 +169,7 @@ client.stop_stream()
 | `ready_timeout` | `10.0` | Max seconds to wait for non-black frames |
 | `black_frame_threshold` | `5.0` | Mean pixel value above which a frame is considered real |
 
-All existing code that doesn't call `start_stream()` continues to work unchanged.
+**Note:** `record()` requires `start_stream()` to be called first. `stream()` and `latest_frame()` can still create their own connections if no shared stream is active.
 
 ### Latest Frame Buffer (for CV Pipelines)
 
@@ -188,14 +189,20 @@ with client.latest_frame(app="Desktop", width=1280, height=720, fps=30) as buf:
 
 ### Recording
 
-Record to a video file or a directory of images. The output format is auto-detected from the path.
+Record to a video file or a directory of images. The output format is auto-detected from the path. **Requires `start_stream()` first.**
+
+Recordings use wall-clock timestamps — dropped frames create real time gaps rather than being silently compressed.
 
 ```python
+client.start_stream(app="Desktop", width=1920, height=1080, fps=30)
+
 # Record 60 seconds of video
-client.record("capture.mp4", app="Desktop", width=1920, height=1080, fps=30, duration=60)
+client.record("capture.mp4", duration=60)
 
 # Record 100 frames as PNGs
-client.record("./frames/", app="Desktop", max_frames=100)
+client.record("./frames/", max_frames=100)
+
+client.stop_stream()
 ```
 
 You can also use the recorder classes directly for more control:

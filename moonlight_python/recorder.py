@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -72,13 +73,16 @@ class VideoRecorder:
         self._stream.width = width
         self._stream.height = height
         self._stream.pix_fmt = "yuv420p"
+        self._stream.time_base = Fraction(1, 1000)
         self._closed = False
 
-    def write(self, frame: Frame) -> None:
+    def write(self, frame: Frame, pts: int | None = None) -> None:
         """Encode and write a frame to the video file.
 
         Args:
             frame: Frame to write.
+            pts: Presentation timestamp in time_base units (milliseconds).
+                 When provided, sets the frame PTS for variable-framerate output.
         """
         import av
 
@@ -88,6 +92,8 @@ class VideoRecorder:
         # Convert BGR to RGB
         rgb = frame.data[:, :, ::-1]
         video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+        if pts is not None:
+            video_frame.pts = pts
         for packet in self._stream.encode(video_frame):
             self._container.mux(packet)
 

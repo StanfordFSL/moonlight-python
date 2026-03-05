@@ -176,6 +176,7 @@ class StreamManager:
         """Background thread: pull frames, gate on black frames, fan out."""
         ready = False
         try:
+            self._session.request_idr()
             for frame in stream_frames(self._session, self._decoder):
                 if not self._running:
                     break

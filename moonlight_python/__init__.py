@@ -296,47 +296,42 @@ class MoonlightClient:
                max_frames: int | None = None) -> None:
         """Record a stream to a video file or directory of images.
 
-        If start_stream() was called, records from the shared stream with
-        accurate timing (no setup delay). Otherwise creates its own
-        connection (legacy behavior).
-
-        Auto-detects mode by the output path:
+        Requires an active stream via start_stream(). Auto-detects mode
+        by the output path:
         - File with video extension (.mp4, .mkv, .avi) → VideoRecorder
         - Directory or path without video extension → ImageRecorder
 
+        Recordings use wall-clock timestamps — dropped frames create real
+        time gaps rather than being silently compressed.
+
         Args:
             output: Output file path or directory.
-            app: Application name to stream.
+            app: Unused (kept for API compatibility).
             width: Video width in pixels.
             height: Video height in pixels.
             fps: Frames per second.
-            bitrate_kbps: Bitrate in kbps.
-            codec: Video codec ("h264", "hevc", "av1").
+            bitrate_kbps: Unused (kept for API compatibility).
+            codec: Unused (kept for API compatibility).
             duration: Max recording duration in seconds (None = unlimited).
             max_frames: Max number of frames to record (None = unlimited).
         """
+        if self._stream_manager is None or not self._stream_manager.is_running:
+            raise StreamNotActiveError(
+                "record() requires an active stream. Call start_stream() first."
+            )
+
         output_path = Path(output)
         video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
         is_video = output_path.suffix.lower() in video_extensions
 
-        # When using shared stream, subscribe and record with immediate timer
-        if self._stream_manager is not None and self._stream_manager.is_running:
-            sub = self._stream_manager.subscribe()
-            try:
-                self._record_from_frames(
-                    sub, output_path, is_video, width, height, fps,
-                    duration, max_frames, start_timer_immediately=True,
-                )
-            finally:
-                self._stream_manager.unsubscribe(sub)
-            return
-
-        # Legacy path: create own connection
-        self._record_from_frames(
-            self.stream(app, width, height, fps, bitrate_kbps, codec),
-            output_path, is_video, width, height, fps,
-            duration, max_frames, start_timer_immediately=False,
-        )
+        sub = self._stream_manager.subscribe()
+        try:
+            self._record_from_frames(
+                sub, output_path, is_video, width, height, fps,
+                duration, max_frames,
+            )
+        finally:
+            self._stream_manager.unsubscribe(sub)
 
     def _record_from_frames(
         self,
@@ -348,20 +343,25 @@ class MoonlightClient:
         fps: int,
         duration: float | None,
         max_frames: int | None,
-        start_timer_immediately: bool,
     ) -> None:
         """Record frames from any iterator to the given output path."""
         count = 0
-        start_time = time.monotonic() if start_timer_immediately else None
+        start_time = time.monotonic()
+        last_pts = -1
 
         recorder_cls = VideoRecorder if is_video else ImageRecorder
         recorder_args = (output_path, width, height, fps) if is_video else (output_path,)
 
         with recorder_cls(*recorder_args) as recorder:
             for frame in frames:
-                if start_time is None:
-                    start_time = time.monotonic()
-                recorder.write(frame)
+                if is_video:
+                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
+                    if elapsed_ms <= last_pts:
+                        elapsed_ms = last_pts + 1
+                    recorder.write(frame, pts=elapsed_ms)
+                    last_pts = elapsed_ms
+                else:
+                    recorder.write(frame)
                 count += 1
                 if max_frames is not None and count >= max_frames:
                     break

@@ -137,6 +137,7 @@ bool LiPollNextVideoFrame(VIDEO_FRAME_HANDLE* frameHandle, DECODE_UNIT** decodeU
 void LiWakeWaitForVideoFrame(void);
 void LiCompleteVideoFrame(VIDEO_FRAME_HANDLE handle, int drStatus);
 void LiRequestIdrFrame(void);
+int LiSendMouseMoveEvent(short deltaX, short deltaY);
 """
 
 # Capability flags
@@ -422,6 +423,12 @@ class StreamingSession:
         """Request an IDR (keyframe) from the server."""
         if self._connected:
             self._lib.LiRequestIdrFrame()
+
+    def nudge_mouse(self) -> None:
+        """Send a tiny mouse move to trigger a screen change on the server."""
+        if self._connected:
+            self._lib.LiSendMouseMoveEvent(1, 0)
+            self._lib.LiSendMouseMoveEvent(-1, 0)
 
     def wake(self) -> None:
         """Wake up LiWaitForNextVideoFrame() so a blocked pull thread can exit."""

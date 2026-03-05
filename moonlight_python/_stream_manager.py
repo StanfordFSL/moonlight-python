@@ -175,17 +175,29 @@ class StreamManager:
     def _run(self) -> None:
         """Background thread: pull frames, gate on black frames, fan out."""
         ready = False
+        idr_stop = threading.Event()
+
+        def _request_idr_periodically() -> None:
+            """Send IDR requests and mouse nudges every 500ms until real frames arrive."""
+            while not idr_stop.wait(0.5):
+                self._session.request_idr()
+                self._session.nudge_mouse()
+
+        idr_thread = threading.Thread(target=_request_idr_periodically, daemon=True)
+        self._session.request_idr()
+        self._session.nudge_mouse()
+        idr_thread.start()
+
         try:
-            self._session.request_idr()
             for frame in stream_frames(self._session, self._decoder):
                 if not self._running:
                     break
 
                 if not ready:
                     if not _is_real_frame(frame, self._black_frame_threshold):
-                        self._session.request_idr()
                         continue
                     ready = True
+                    idr_stop.set()
                     self._ready_event.set()
 
                 with self._lock:
@@ -196,6 +208,7 @@ class StreamManager:
             self._error = exc
             self._ready_event.set()  # Unblock start() if still waiting
         finally:
+            idr_stop.set()
             self._running = False
             with self._lock:
                 for sub in self._subscribers:

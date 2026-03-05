@@ -237,6 +237,7 @@ class NvHTTP:
             hostname=get("hostname"),
             mac=get("mac"),
             unique_id=get("uniqueid"),
+            http_port=self.http_port,
             https_port=https_port,
             app_version=get("appversion"),
             gfe_version=get("GfeVersion"),

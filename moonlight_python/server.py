@@ -13,6 +13,7 @@ class ServerInfo:
     hostname: str = ""
     mac: str = ""
     unique_id: str = ""
+    http_port: int = 47989
     https_port: int = 47984
     app_version: str = ""
     gfe_version: str = ""

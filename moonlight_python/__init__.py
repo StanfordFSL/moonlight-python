@@ -177,12 +177,14 @@ class MoonlightClient:
 
         if pin is None:
             pin = f"{random.randint(0, 9999):04d}"
+            web_port = server.https_port + 1
             print(f"PIN: {pin}")
             print(f"Enter this PIN in the Sunshine web UI at "
-                  f"https://{server.address}:47990")
+                  f"https://{server.address}:{web_port}")
 
         http = NvHTTP(
             server.address, self._identity,
+            http_port=server.http_port,
             https_port=server.https_port,
         )
 
@@ -196,6 +198,7 @@ class MoonlightClient:
         # Re-create HTTP client with the pinned cert
         self._http = NvHTTP(
             server.address, self._identity,
+            http_port=server.http_port,
             https_port=server.https_port,
             server_cert_pem=cert_pem,
         )
@@ -529,6 +532,7 @@ class MoonlightClient:
         if server is not None:
             return NvHTTP(
                 server.address, self._identity,
+                http_port=server.http_port,
                 https_port=server.https_port,
                 server_cert_pem=server.server_cert_pem,
             )

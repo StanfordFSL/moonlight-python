@@ -41,18 +41,10 @@ jobs:
       - name: Inspect built wheel (debug)
         if: runner.os == 'Windows'
         run: |
-          pip install delvewheel
+          pip install delvewheel machomachomangler
           Get-ChildItem wheelhouse\*.whl | ForEach-Object {
             echo "=== $($_.Name) ==="
-            $tmp = New-TemporaryFile | ForEach-Object { Remove-Item $_; mkdir $_ }
-            Expand-Archive $_.FullName -DestinationPath $tmp
-            $dll = Get-ChildItem -Recurse -Path $tmp -Filter "moonlight-common-c.dll" | Select-Object -First 1
-            if ($dll) {
-              echo "DLL size: $($dll.Length) bytes"
-              dumpbin /dependents $dll.FullName
-              delvewheel needed $_.FullName
-            }
-            Remove-Item $tmp -Recurse
+            delvewheel needed $_.FullName
           }
 
       - uses: actions/upload-artifact@v4

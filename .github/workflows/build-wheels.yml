@@ -29,12 +29,31 @@ jobs:
         run: |
           dir "C:\Program Files\OpenSSL"
           dir "C:\Program Files\OpenSSL\include"
+          dir "C:\Program Files\OpenSSL\lib"
+          dir "C:\Program Files\OpenSSL\bin"
           echo "OPENSSL_ROOT_DIR=$env:OPENSSL_ROOT_DIR"
 
       - name: Build wheels
         run: cibuildwheel --output-dir wheelhouse
         env:
           OPENSSL_ROOT_DIR: ${{ runner.os == 'Windows' && 'C:\Program Files\OpenSSL' || '' }}
+
+      - name: Inspect built wheel (debug)
+        if: runner.os == 'Windows'
+        run: |
+          pip install delvewheel
+          Get-ChildItem wheelhouse\*.whl | ForEach-Object {
+            echo "=== $($_.Name) ==="
+            $tmp = New-TemporaryFile | ForEach-Object { Remove-Item $_; mkdir $_ }
+            Expand-Archive $_.FullName -DestinationPath $tmp
+            $dll = Get-ChildItem -Recurse -Path $tmp -Filter "moonlight-common-c.dll" | Select-Object -First 1
+            if ($dll) {
+              echo "DLL size: $($dll.Length) bytes"
+              dumpbin /dependents $dll.FullName
+              delvewheel needed $_.FullName
+            }
+            Remove-Item $tmp -Recurse
+          }
 
       - uses: actions/upload-artifact@v4
         with:

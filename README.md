@@ -73,10 +73,11 @@ for s in servers:
     print(f"{s.hostname} @ {s.address}")
 ```
 
-Or connect directly by IP:
+Or connect directly by IP (optionally specify the HTTP port, default `47989`):
 
 ```python
 server = client.connect("192.168.1.100")
+server = client.connect("192.168.1.100", port=48089)  # custom port
 ```
 
 ### Pairing

@@ -123,6 +123,53 @@ for frame in client.stream(app="Desktop", width=1280, height=720, fps=30):
 | `codec` | `"h264"` | Video codec: `"h264"`, `"hevc"`, or `"av1"` |
 | `output_format` | `"bgr24"` | Pixel format: `"bgr24"` or `"rgb24"` |
 
+### Persistent Shared Stream
+
+By default, each call to `stream()`, `record()`, or `latest_frame()` creates its own RTSP connection. If you need multiple operations on the same stream (e.g., record while also reading frames), use `start_stream()` to establish a single persistent connection that all operations share.
+
+```python
+client.connect("192.168.1.100")
+
+# Start a persistent stream — blocks until real (non-black) frames are flowing
+client.start_stream(app="Desktop", width=1920, height=1080, fps=30)
+
+# Record from the active stream (no new connection, accurate duration)
+client.record("capture.mp4", duration=5)       # exactly 5 seconds
+
+# Iterate frames from the active stream
+for frame in client.stream():
+    process(frame.data)
+
+# Get the latest frame for CV pipelines
+with client.latest_frame() as buf:
+    frame = buf.get(timeout=1.0)
+
+# Explicit cleanup (also auto-cleans on exit)
+client.stop_stream()
+```
+
+`start_stream()` solves three problems compared to letting each method create its own connection:
+
+1. **No duplicate connections** — a second RTSP connection can disrupt an existing Sunshine session. With a shared stream, `record()` and `stream()` tap into the same connection.
+2. **Accurate recording duration** — `record()` starts its timer immediately since the stream is already warm, rather than losing seconds to connection setup.
+3. **No black frames** — `start_stream()` waits for real (non-black) frames before returning, so consumers only see actual content.
+
+**`start_stream()` parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `app` | `"Desktop"` | Application name to stream |
+| `width` | `1920` | Video width in pixels |
+| `height` | `1080` | Video height in pixels |
+| `fps` | `30` | Frames per second |
+| `bitrate_kbps` | `10000` | Bitrate in kbps |
+| `codec` | `"h264"` | Video codec: `"h264"`, `"hevc"`, or `"av1"` |
+| `output_format` | `"bgr24"` | Pixel format: `"bgr24"` or `"rgb24"` |
+| `ready_timeout` | `10.0` | Max seconds to wait for non-black frames |
+| `black_frame_threshold` | `5.0` | Mean pixel value above which a frame is considered real |
+
+All existing code that doesn't call `start_stream()` continues to work unchanged.
+
 ### Latest Frame Buffer (for CV Pipelines)
 
 If your model processes frames slower than the stream produces them, use `latest_frame()`. It runs the stream in a background thread and always gives you the most recent frame, dropping old ones.
@@ -216,6 +263,32 @@ with client.latest_frame(app="Desktop", width=1280, height=720, fps=30) as buf:
             print(f"[Frame {frame.frame_number}] {det.label}: {det.confidence:.2f}")
 ```
 
+## Full Example: Shared Stream with Recording
+
+```python
+from moonlight_python import MoonlightClient
+
+client = MoonlightClient()
+client.connect("192.168.1.100")
+
+# Start a persistent stream (blocks until real frames arrive)
+client.start_stream(app="Desktop", width=1920, height=1080, fps=30)
+
+# Record exactly 10 seconds — duration is accurate because the stream is warm
+client.record("clip.mp4", duration=10)
+
+# Record 50 frames as images
+client.record("./frames/", max_frames=50)
+
+# Also iterate frames for real-time processing
+for frame in client.stream():
+    result = my_model(frame.data)
+    if done:
+        break
+
+client.stop_stream()
+```
+
 ## Development
 
 ```bash
@@ -236,6 +309,7 @@ MoonlightClient (high-level API)
 ├── pairing            — 5-stage cryptographic pairing protocol
 ├── StreamingSession  — CFFI bindings to moonlight-common-c
 ├── Decoder            — PyAV (FFmpeg) H.264/HEVC/AV1 decoding
+├── StreamManager     — Persistent shared stream with fan-out to subscribers
 ├── LatestFrameBuffer — Thread-safe latest-frame buffer
 └── ImageRecorder / VideoRecorder — Recording support
 ```

@@ -444,28 +444,25 @@ def stream_frames(session: StreamingSession, decoder: Decoder) -> Iterator[Frame
     Yields:
         Frame objects containing decoded numpy array and metadata
     """
-    try:
-        while session.is_connected:
-            raw = session.pull_frame()
-            if raw is None:
-                if session.is_terminated:
-                    error = session.termination_error
-                    if error != 0:
-                        raise StreamTerminatedError(error)
-                    return  # Graceful termination
-                continue
+    while session.is_connected:
+        raw = session.pull_frame()
+        if raw is None:
+            if session.is_terminated:
+                error = session.termination_error
+                if error != 0:
+                    raise StreamTerminatedError(error)
+                return  # Graceful termination
+            continue
 
-            decoded_frames = decoder.decode(raw.annex_b_data)
-            for arr in decoded_frames:
-                yield Frame(
-                    data=arr,
-                    frame_number=raw.frame_number,
-                    frame_type=raw.frame_type,
-                    timestamp_us=raw.timestamp_us,
-                    receive_time_us=raw.receive_time_us,
-                    enqueue_time_us=raw.enqueue_time_us,
-                    rtp_timestamp=raw.rtp_timestamp,
-                    host_processing_latency_us=raw.host_processing_latency_us,
-                )
-    finally:
-        session.stop()
+        decoded_frames = decoder.decode(raw.annex_b_data)
+        for arr in decoded_frames:
+            yield Frame(
+                data=arr,
+                frame_number=raw.frame_number,
+                frame_type=raw.frame_type,
+                timestamp_us=raw.timestamp_us,
+                receive_time_us=raw.receive_time_us,
+                enqueue_time_us=raw.enqueue_time_us,
+                rtp_timestamp=raw.rtp_timestamp,
+                host_processing_latency_us=raw.host_processing_latency_us,
+            )

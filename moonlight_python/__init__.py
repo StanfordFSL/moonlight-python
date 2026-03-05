@@ -36,6 +36,7 @@ from .exceptions import (
     MoonlightError,
     PairingError,
     StreamingError,
+    StreamNotActiveError,
 )
 from .frame import Frame
 from .http_client import NvHTTP
@@ -43,6 +44,7 @@ from .identity import Identity
 from .pairing import pair as do_pair
 from .recorder import ImageRecorder, VideoRecorder
 from .server import AppInfo, ServerInfo
+from ._stream_manager import StreamManager
 from .stream import StreamingSession, stream_frames
 
 __all__ = [
@@ -58,7 +60,58 @@ __all__ = [
     "PairingError",
     "StreamingError",
     "ConnectionError",
+    "StreamNotActiveError",
 ]
+
+
+class _SharedLatestFrameBuffer:
+    """Lightweight adapter that reads latest_frame from a StreamManager.
+
+    Provides the same interface as LatestFrameBuffer for use as a drop-in
+    replacement when a shared stream is active.
+    """
+
+    def __init__(self, manager: StreamManager) -> None:
+        self._manager = manager
+
+    def start(self) -> None:
+        """No-op — stream is already running."""
+
+    def stop(self) -> None:
+        """No-op — stream lifecycle managed by stop_stream()."""
+
+    def get(self, timeout: float | None = None) -> Frame | None:
+        """Poll the shared stream's latest frame.
+
+        Args:
+            timeout: Max seconds to wait for a frame.
+
+        Returns:
+            The most recent Frame, or None if timeout expired.
+        """
+        if timeout is None:
+            timeout = 30.0
+        if timeout == 0:
+            return self._manager.latest_frame
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = self._manager.latest_frame
+            if frame is not None:
+                return frame
+            time.sleep(0.01)
+        return self._manager.latest_frame
+
+    @property
+    def stats(self) -> dict[str, int]:
+        return {"frames_received": 0, "frames_dropped": 0}
+
+    def __enter__(self) -> _SharedLatestFrameBuffer:
+        self.start()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.stop()
 
 
 class MoonlightClient:
@@ -70,6 +123,7 @@ class MoonlightClient:
         self._server: ServerInfo | None = None
         self._session: StreamingSession | None = None
         self._decoder: Decoder | None = None
+        self._stream_manager: StreamManager | None = None
 
         # Register cleanup
         atexit.register(self._cleanup)
@@ -163,6 +217,9 @@ class MoonlightClient:
                output_format: str = "bgr24") -> Iterator[Frame]:
         """Stream an application and yield decoded video frames.
 
+        If start_stream() was called, subscribes to the shared stream.
+        Otherwise creates its own connection (legacy behavior).
+
         Args:
             app: Application name to stream (default "Desktop")
             width: Video width in pixels
@@ -175,6 +232,15 @@ class MoonlightClient:
         Yields:
             Frame objects with .data as numpy array (H, W, 3) uint8
         """
+        if self._stream_manager is not None and self._stream_manager.is_running:
+            sub = self._stream_manager.subscribe()
+            try:
+                yield from sub
+            finally:
+                self._stream_manager.unsubscribe(sub)
+            return
+
+        # Legacy path: create own connection
         session, decoder = self._setup_stream(
             app, width, height, fps, bitrate_kbps, codec, output_format,
         )
@@ -187,12 +253,12 @@ class MoonlightClient:
     def latest_frame(self, app: str = "Desktop", width: int = 1920,
                      height: int = 1080, fps: int = 30,
                      bitrate_kbps: int = 10000, codec: str = "h264",
-                     output_format: str = "bgr24") -> LatestFrameBuffer:
+                     output_format: str = "bgr24") -> LatestFrameBuffer | _SharedLatestFrameBuffer:
         """Start streaming and return a LatestFrameBuffer context manager.
 
-        The buffer runs the stream in a background thread and always holds
-        the most recent frame, dropping older ones. Ideal for CV pipelines
-        that process at variable rates.
+        If start_stream() was called, returns a lightweight adapter that
+        reads from the shared stream. Otherwise creates its own connection
+        (legacy behavior).
 
         Usage::
 
@@ -212,8 +278,12 @@ class MoonlightClient:
             output_format: Pixel format — "bgr24" (default) or "rgb24"
 
         Returns:
-            LatestFrameBuffer (use as context manager)
+            LatestFrameBuffer or _SharedLatestFrameBuffer (use as context manager)
         """
+        if self._stream_manager is not None and self._stream_manager.is_running:
+            return _SharedLatestFrameBuffer(self._stream_manager)
+
+        # Legacy path: create own connection
         session, decoder = self._setup_stream(
             app, width, height, fps, bitrate_kbps, codec, output_format,
         )
@@ -225,6 +295,10 @@ class MoonlightClient:
                duration: float | None = None,
                max_frames: int | None = None) -> None:
         """Record a stream to a video file or directory of images.
+
+        If start_stream() was called, records from the shared stream with
+        accurate timing (no setup delay). Otherwise creates its own
+        connection (legacy behavior).
 
         Auto-detects mode by the output path:
         - File with video extension (.mp4, .mkv, .avi) → VideoRecorder
@@ -245,33 +319,100 @@ class MoonlightClient:
         video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
         is_video = output_path.suffix.lower() in video_extensions
 
-        count = 0
-        start_time: float | None = None
+        # When using shared stream, subscribe and record with immediate timer
+        if self._stream_manager is not None and self._stream_manager.is_running:
+            sub = self._stream_manager.subscribe()
+            try:
+                self._record_from_frames(
+                    sub, output_path, is_video, width, height, fps,
+                    duration, max_frames, start_timer_immediately=True,
+                )
+            finally:
+                self._stream_manager.unsubscribe(sub)
+            return
 
-        if is_video:
-            with VideoRecorder(output_path, width, height, fps) as recorder:
-                for frame in self.stream(app, width, height, fps,
-                                         bitrate_kbps, codec):
-                    if start_time is None:
-                        start_time = time.monotonic()
-                    recorder.write(frame)
-                    count += 1
-                    if max_frames is not None and count >= max_frames:
-                        break
-                    if duration is not None and (time.monotonic() - start_time) >= duration:
-                        break
-        else:
-            with ImageRecorder(output_path) as recorder:
-                for frame in self.stream(app, width, height, fps,
-                                         bitrate_kbps, codec):
-                    if start_time is None:
-                        start_time = time.monotonic()
-                    recorder.write(frame)
-                    count += 1
-                    if max_frames is not None and count >= max_frames:
-                        break
-                    if duration is not None and (time.monotonic() - start_time) >= duration:
-                        break
+        # Legacy path: create own connection
+        self._record_from_frames(
+            self.stream(app, width, height, fps, bitrate_kbps, codec),
+            output_path, is_video, width, height, fps,
+            duration, max_frames, start_timer_immediately=False,
+        )
+
+    def _record_from_frames(
+        self,
+        frames: Iterator[Frame],
+        output_path: Path,
+        is_video: bool,
+        width: int,
+        height: int,
+        fps: int,
+        duration: float | None,
+        max_frames: int | None,
+        start_timer_immediately: bool,
+    ) -> None:
+        """Record frames from any iterator to the given output path."""
+        count = 0
+        start_time = time.monotonic() if start_timer_immediately else None
+
+        recorder_cls = VideoRecorder if is_video else ImageRecorder
+        recorder_args = (output_path, width, height, fps) if is_video else (output_path,)
+
+        with recorder_cls(*recorder_args) as recorder:
+            for frame in frames:
+                if start_time is None:
+                    start_time = time.monotonic()
+                recorder.write(frame)
+                count += 1
+                if max_frames is not None and count >= max_frames:
+                    break
+                if duration is not None and (time.monotonic() - start_time) >= duration:
+                    break
+
+    def start_stream(self, app: str = "Desktop", width: int = 1920,
+                     height: int = 1080, fps: int = 30,
+                     bitrate_kbps: int = 10000, codec: str = "h264",
+                     output_format: str = "bgr24",
+                     ready_timeout: float = 10.0,
+                     black_frame_threshold: float = 5.0) -> None:
+        """Start a persistent shared stream. Blocks until real frames flow.
+
+        After calling this, stream(), record(), and latest_frame() will all
+        tap into this shared connection instead of creating their own.
+
+        Args:
+            app: Application name to stream (default "Desktop")
+            width: Video width in pixels
+            height: Video height in pixels
+            fps: Frames per second
+            bitrate_kbps: Bitrate in kbps
+            codec: Video codec ("h264", "hevc", "av1")
+            output_format: Pixel format — "bgr24" (default) or "rgb24"
+            ready_timeout: Max seconds to wait for non-black frames
+            black_frame_threshold: Mean pixel value threshold for real frames
+        """
+        if self._stream_manager is not None and self._stream_manager.is_running:
+            raise StreamingError("Stream already active. Call stop_stream() first.")
+
+        session, decoder = self._setup_stream(
+            app, width, height, fps, bitrate_kbps, codec, output_format,
+        )
+
+        manager = StreamManager(session, decoder, fps)
+        try:
+            manager.start(ready_timeout=ready_timeout,
+                          black_frame_threshold=black_frame_threshold)
+        except Exception:
+            self._stop_streaming()
+            raise
+
+        self._stream_manager = manager
+
+    def stop_stream(self) -> None:
+        """Stop the persistent shared stream and clean up."""
+        if self._stream_manager is not None:
+            self._stream_manager.stop()
+            self._stream_manager = None
+        self._stop_streaming()
 
     def quit_app(self) -> None:
         """Quit the currently running app on the server."""
@@ -398,4 +539,4 @@ class MoonlightClient:
             self._decoder = None
 
     def _cleanup(self) -> None:
-        self._stop_streaming()
+        self.stop_stream()

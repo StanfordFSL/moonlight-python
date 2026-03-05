@@ -55,5 +55,9 @@ class StreamTerminatedError(StreamingError):
         super().__init__(f"Stream terminated (error {error_code})")
 
 
+class StreamNotActiveError(StreamingError):
+    """Operation requires an active stream but none is running."""
+
+
 class DecoderError(MoonlightError):
     """Video decoding error."""

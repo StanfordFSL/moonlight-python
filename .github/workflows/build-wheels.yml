@@ -24,12 +24,6 @@ jobs:
       - name: Install cibuildwheel
         run: pip install cibuildwheel
 
-      - name: Find OpenSSL (debug)
-        if: runner.os == 'Windows'
-        run: |
-          echo "=== Searching for libcrypto-3-x64.dll ==="
-          Get-ChildItem -Path "C:\" -Filter "libcrypto-3-x64.dll" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { echo $_.FullName }
-
       - name: Build wheels
         run: cibuildwheel --output-dir wheelhouse
         env:

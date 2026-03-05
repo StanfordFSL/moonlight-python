@@ -425,10 +425,9 @@ class StreamingSession:
             self._lib.LiRequestIdrFrame()
 
     def nudge_mouse(self) -> None:
-        """Send a tiny mouse move to trigger a screen change on the server."""
+        """Send a mouse move to trigger a screen change on the server."""
         if self._connected:
-            self._lib.LiSendMouseMoveEvent(1, 0)
-            self._lib.LiSendMouseMoveEvent(-1, 0)
+            self._lib.LiSendMouseMoveEvent(10, 0)
 
     def wake(self) -> None:
         """Wake up LiWaitForNextVideoFrame() so a blocked pull thread can exit."""

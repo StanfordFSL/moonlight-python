@@ -324,11 +324,12 @@ class MoonlightClient:
         video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
         is_video = output_path.suffix.lower() in video_extensions
 
+        first_frame = self._stream_manager.latest_frame
         sub = self._stream_manager.subscribe()
         try:
             self._record_from_frames(
                 sub, output_path, is_video, width, height, fps,
-                duration, max_frames,
+                duration, max_frames, first_frame=first_frame,
             )
         finally:
             self._stream_manager.unsubscribe(sub)
@@ -343,6 +344,7 @@ class MoonlightClient:
         fps: int,
         duration: float | None,
         max_frames: int | None,
+        first_frame: Frame | None = None,
     ) -> None:
         """Record frames from any iterator to the given output path."""
         count = 0
@@ -353,6 +355,15 @@ class MoonlightClient:
         recorder_args = (output_path, width, height, fps) if is_video else (output_path,)
 
         with recorder_cls(*recorder_args) as recorder:
+            # Write the latest frame as the first frame (avoids black start)
+            if first_frame is not None:
+                if is_video:
+                    recorder.write(first_frame, pts=0)
+                    last_pts = 0
+                else:
+                    recorder.write(first_frame)
+                count += 1
+
             for frame in frames:
                 if is_video:
                     elapsed_ms = int((time.monotonic() - start_time) * 1000)

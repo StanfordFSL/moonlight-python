@@ -183,6 +183,7 @@ class StreamManager:
 
                 if not ready:
                     if not _is_real_frame(frame, self._black_frame_threshold):
+                        self._session.request_idr()
                         continue
                     ready = True
                     self._ready_event.set()

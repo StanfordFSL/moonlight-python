@@ -73,7 +73,6 @@ class VideoRecorder:
         self._stream.width = width
         self._stream.height = height
         self._stream.pix_fmt = "yuv420p"
-        self._stream.time_base = Fraction(1, 1000)
         self._closed = False
 
     def write(self, frame: Frame, pts: int | None = None) -> None:
@@ -94,6 +93,7 @@ class VideoRecorder:
         video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
         if pts is not None:
             video_frame.pts = pts
+            video_frame.time_base = Fraction(1, 1000)
         for packet in self._stream.encode(video_frame):
             self._container.mux(packet)
 

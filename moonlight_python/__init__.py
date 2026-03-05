@@ -349,7 +349,6 @@ class MoonlightClient:
         """Record frames from any iterator to the given output path."""
         count = 0
         start_time = time.monotonic()
-        last_pts = -1
 
         recorder_cls = VideoRecorder if is_video else ImageRecorder
         recorder_args = (output_path, width, height, fps) if is_video else (output_path,)
@@ -359,7 +358,6 @@ class MoonlightClient:
             if first_frame is not None:
                 if is_video:
                     recorder.write(first_frame, pts=0)
-                    last_pts = 0
                 else:
                     recorder.write(first_frame)
                 count += 1
@@ -367,10 +365,7 @@ class MoonlightClient:
             for frame in frames:
                 if is_video:
                     elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                    if elapsed_ms <= last_pts:
-                        elapsed_ms = last_pts + 1
                     recorder.write(frame, pts=elapsed_ms)
-                    last_pts = elapsed_ms
                 else:
                     recorder.write(frame)
                 count += 1

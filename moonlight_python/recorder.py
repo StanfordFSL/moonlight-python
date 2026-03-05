@@ -72,7 +72,9 @@ class VideoRecorder:
         self._stream.width = width
         self._stream.height = height
         self._stream.pix_fmt = "yuv420p"
+        self._stream.codec_context.max_b_frames = 0
         self._fps = fps
+        self._last_pts = -1
         self._closed = False
 
     def write(self, frame: Frame, pts: int | None = None) -> None:
@@ -93,7 +95,11 @@ class VideoRecorder:
         video_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
         if pts is not None:
             # Convert milliseconds to frame-count units (codec time_base is 1/fps)
-            video_frame.pts = int(pts * self._fps / 1000)
+            frame_pts = pts * self._fps // 1000
+            if frame_pts <= self._last_pts:
+                frame_pts = self._last_pts + 1
+            self._last_pts = frame_pts
+            video_frame.pts = frame_pts
         for packet in self._stream.encode(video_frame):
             self._container.mux(packet)
 

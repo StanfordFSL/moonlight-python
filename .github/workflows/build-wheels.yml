@@ -34,21 +34,26 @@ jobs:
         run: |
           pip install pefile
           python -c "
-          import zipfile, pefile, sys, os
-          for whl in os.listdir('wheelhouse'):
+          import zipfile, pefile, sys, os, shutil, tempfile
+          for whl in sorted(os.listdir('wheelhouse')):
               if not whl.endswith('.whl'): continue
               print(f'=== {whl} ===')
-              with zipfile.ZipFile(f'wheelhouse/{whl}') as z:
-                  for name in z.namelist():
-                      if name.endswith('.dll'):
-                          print(f'  Found: {name}')
-                          z.extract(name, 'tmp_inspect')
-                          pe = pefile.PE(f'tmp_inspect/{name}')
-                          if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
-                              for entry in pe.DIRECTORY_ENTRY_IMPORT:
-                                  print(f'    imports: {entry.dll.decode()}')
-                          else:
-                              print('    no imports found')
+              tmp = tempfile.mkdtemp()
+              try:
+                  with zipfile.ZipFile(f'wheelhouse/{whl}') as z:
+                      for name in z.namelist():
+                          if name.endswith('.dll'):
+                              print(f'  Found: {name}')
+                              z.extract(name, tmp)
+                              pe = pefile.PE(os.path.join(tmp, name))
+                              if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                                  for entry in pe.DIRECTORY_ENTRY_IMPORT:
+                                      print(f'    imports: {entry.dll.decode()}')
+                              else:
+                                  print('    no imports found')
+                              pe.close()
+              finally:
+                  shutil.rmtree(tmp, ignore_errors=True)
           "
 
       - uses: actions/upload-artifact@v4

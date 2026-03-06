@@ -27,7 +27,7 @@ Pre-built wheels are available — no compiler or system dependencies needed.
 > |---|---|
 > | Linux | x86_64, aarch64 |
 > | Windows | amd64 |
-> | macOS | arm64, x86_64 |
+> | macOS | arm64 |
 >
 > If your platform or architecture is not listed above, you can still install from source (see below).
 

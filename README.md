@@ -19,7 +19,17 @@ Built on [moonlight-common-c](https://github.com/moonlight-stream/moonlight-comm
 pip install moonlight-python
 ```
 
-Pre-built wheels are available for Python 3.10–3.14 on Linux (x86_64), Windows (amd64), and macOS (arm64, x86_64) — no compiler or system dependencies needed.
+Pre-built wheels are available — no compiler or system dependencies needed.
+
+> [!NOTE]
+> **Supported platforms for pre-built wheels (Python 3.10–3.14):**
+> | OS | Architecture |
+> |---|---|
+> | Linux | x86_64 |
+> | Windows | amd64 |
+> | macOS | arm64, x86_64 |
+>
+> If your platform or architecture is not listed above, you can still install from source (see below).
 
 ### From Source
 

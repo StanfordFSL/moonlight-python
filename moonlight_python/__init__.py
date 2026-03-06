@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+import requests
 
 from .buffer import LatestFrameBuffer
 from .config import CODEC_MAP, StreamConfig, VIDEO_FORMAT_H264
@@ -35,6 +36,7 @@ from .decoder import Decoder
 from .discovery import connect_to_server, discover_servers
 from .exceptions import (
     ConnectionError,
+    HttpResponseError,
     MoonlightError,
     PairingError,
     StreamingError,
@@ -170,7 +172,12 @@ class MoonlightClient:
             server_cert_pem=server.server_cert_pem,
         )
 
-        if not server.paired:
+        # Check if we're paired by trying an authenticated HTTPS request.
+        # get_app_list() uses mutual TLS — if the server recognizes our
+        # client cert from a previous pairing, this succeeds silently.
+        try:
+            self._http.get_app_list()
+        except (HttpResponseError, requests.RequestException):
             self.pair()
 
         return server

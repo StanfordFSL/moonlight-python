@@ -331,7 +331,7 @@ class MoonlightClient:
         sub = self._stream_manager.subscribe()
         try:
             self._record_from_frames(
-                sub, output_path, is_video, width, height, fps,
+                sub, output_path, is_video, fps,
                 duration, max_frames, first_frame=first_frame,
             )
         finally:
@@ -342,8 +342,6 @@ class MoonlightClient:
         frames: Iterator[Frame],
         output_path: Path,
         is_video: bool,
-        width: int,
-        height: int,
         fps: int,
         duration: float | None,
         max_frames: int | None,
@@ -352,13 +350,18 @@ class MoonlightClient:
         """Record frames from any iterator to the given output path."""
         count = 0
         start_time = time.monotonic()
+        recorder = None
 
-        recorder_cls = VideoRecorder if is_video else ImageRecorder
-        recorder_args = (output_path, width, height, fps) if is_video else (output_path,)
+        def _open_recorder(frame: Frame):
+            if is_video:
+                h, w = frame.data.shape[:2]
+                return VideoRecorder(output_path, w, h, fps)
+            return ImageRecorder(output_path)
 
-        with recorder_cls(*recorder_args) as recorder:
+        try:
             # Write the latest frame as the first frame (avoids black start)
             if first_frame is not None:
+                recorder = _open_recorder(first_frame)
                 if is_video:
                     recorder.write(first_frame, pts=0)
                 else:
@@ -366,6 +369,8 @@ class MoonlightClient:
                 count += 1
 
             for frame in frames:
+                if recorder is None:
+                    recorder = _open_recorder(frame)
                 if is_video:
                     elapsed_ms = int((time.monotonic() - start_time) * 1000)
                     recorder.write(frame, pts=elapsed_ms)
@@ -376,6 +381,9 @@ class MoonlightClient:
                     break
                 if duration is not None and (time.monotonic() - start_time) >= duration:
                     break
+        finally:
+            if recorder is not None:
+                recorder.close()
 
     def start_stream(self, app: str = "Desktop", width: int = 1920,
                      height: int = 1080, fps: int = 30,

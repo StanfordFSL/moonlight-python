@@ -11,9 +11,10 @@ Usage::
     server = client.connect("192.168.1.X")
     client.pair()
 
-    for frame in client.stream(app="Desktop", width=1920, height=1080, fps=30):
-        # frame.data is numpy array (H, W, 3) uint8 BGR
-        result = my_cv_model(frame.data)
+    with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+        for frame in client.stream():
+            # frame.data is numpy array (H, W, 3) uint8 BGR
+            result = my_cv_model(frame.data)
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from __future__ import annotations
 import atexit
 import random
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Iterator
@@ -45,7 +47,7 @@ from .pairing import pair as do_pair
 from .recorder import ImageRecorder, VideoRecorder
 from .server import AppInfo, ServerInfo
 from ._stream_manager import StreamManager
-from .stream import StreamingSession, stream_frames
+from .stream import StreamingSession
 
 __all__ = [
     "MoonlightClient",
@@ -124,6 +126,10 @@ class MoonlightClient:
         self._session: StreamingSession | None = None
         self._decoder: Decoder | None = None
         self._stream_manager: StreamManager | None = None
+        self._recording_thread: threading.Thread | None = None
+        self._recording_stop: threading.Event | None = None
+        self._recording_sub = None
+        self._recording_error: BaseException | None = None
 
         # Register cleanup
         atexit.register(self._cleanup)
@@ -215,89 +221,44 @@ class MoonlightClient:
         http = self._get_http(server)
         return http.get_app_list()
 
-    def stream(self, app: str = "Desktop", width: int = 1920, height: int = 1080,
-               fps: int = 30, bitrate_kbps: int = 10000, codec: str = "h264",
-               output_format: str = "bgr24") -> Iterator[Frame]:
-        """Stream an application and yield decoded video frames.
+    def stream(self) -> Iterator[Frame]:
+        """Yield decoded video frames from the active stream.
 
-        If start_stream() was called, subscribes to the shared stream.
-        Otherwise creates its own connection (legacy behavior).
-
-        Args:
-            app: Application name to stream (default "Desktop")
-            width: Video width in pixels
-            height: Video height in pixels
-            fps: Frames per second
-            bitrate_kbps: Bitrate in kbps
-            codec: Video codec ("h264", "hevc", "av1")
-            output_format: Pixel format — "bgr24" (default) or "rgb24"
+        Requires an active stream via start_stream().
 
         Yields:
             Frame objects with .data as numpy array (H, W, 3) uint8
         """
-        if self._stream_manager is not None and self._stream_manager.is_running:
-            sub = self._stream_manager.subscribe()
-            try:
-                yield from sub
-            finally:
-                self._stream_manager.unsubscribe(sub)
-            return
-
-        # Legacy path: create own connection
-        session, decoder = self._setup_stream(
-            app, width, height, fps, bitrate_kbps, codec, output_format,
-        )
-
+        self._require_stream("stream")
+        sub = self._stream_manager.subscribe()
         try:
-            yield from stream_frames(session, decoder)
+            yield from sub
         finally:
-            self._stop_streaming()
+            self._stream_manager.unsubscribe(sub)
 
-    def latest_frame(self, app: str = "Desktop", width: int = 1920,
-                     height: int = 1080, fps: int = 30,
-                     bitrate_kbps: int = 10000, codec: str = "h264",
-                     output_format: str = "bgr24") -> LatestFrameBuffer | _SharedLatestFrameBuffer:
-        """Start streaming and return a LatestFrameBuffer context manager.
+    def latest_frame(self) -> _SharedLatestFrameBuffer:
+        """Return a latest-frame reader for the active stream.
 
-        If start_stream() was called, returns a lightweight adapter that
-        reads from the shared stream. Otherwise creates its own connection
-        (legacy behavior).
+        Requires an active stream via start_stream().
 
         Usage::
 
-            with client.latest_frame(app="Desktop") as buf:
+            with client.latest_frame() as buf:
                 while True:
                     frame = buf.get(timeout=1.0)
                     if frame:
                         result = my_model(frame.data)
 
-        Args:
-            app: Application name to stream (default "Desktop")
-            width: Video width in pixels
-            height: Video height in pixels
-            fps: Frames per second
-            bitrate_kbps: Bitrate in kbps
-            codec: Video codec ("h264", "hevc", "av1")
-            output_format: Pixel format — "bgr24" (default) or "rgb24"
-
         Returns:
-            LatestFrameBuffer or _SharedLatestFrameBuffer (use as context manager)
+            _SharedLatestFrameBuffer (use as context manager)
         """
-        if self._stream_manager is not None and self._stream_manager.is_running:
-            return _SharedLatestFrameBuffer(self._stream_manager)
+        self._require_stream("latest_frame")
+        return _SharedLatestFrameBuffer(self._stream_manager)
 
-        # Legacy path: create own connection
-        session, decoder = self._setup_stream(
-            app, width, height, fps, bitrate_kbps, codec, output_format,
-        )
-        return LatestFrameBuffer(session, decoder)
-
-    def record(self, output: str | Path, app: str = "Desktop",
-               width: int = 1920, height: int = 1080, fps: int = 30,
-               bitrate_kbps: int = 10000, codec: str = "h264",
+    def record(self, output: str | Path,
                duration: float | None = None,
                max_frames: int | None = None) -> None:
-        """Record a stream to a video file or directory of images.
+        """Record from the active stream to a video file or directory of images.
 
         Requires an active stream via start_stream(). Auto-detects mode
         by the output path:
@@ -309,19 +270,11 @@ class MoonlightClient:
 
         Args:
             output: Output file path or directory.
-            app: Unused (kept for API compatibility).
-            width: Video width in pixels.
-            height: Video height in pixels.
-            fps: Frames per second.
-            bitrate_kbps: Unused (kept for API compatibility).
-            codec: Unused (kept for API compatibility).
             duration: Max recording duration in seconds (None = unlimited).
             max_frames: Max number of frames to record (None = unlimited).
         """
-        if self._stream_manager is None or not self._stream_manager.is_running:
-            raise StreamNotActiveError(
-                "record() requires an active stream. Call start_stream() first."
-            )
+        self._require_stream("record")
+        fps = self._stream_manager.fps
 
         output_path = Path(output)
         video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
@@ -346,6 +299,7 @@ class MoonlightClient:
         duration: float | None,
         max_frames: int | None,
         first_frame: Frame | None = None,
+        stop_event: threading.Event | None = None,
     ) -> None:
         """Record frames from any iterator to the given output path."""
         count = 0
@@ -369,6 +323,8 @@ class MoonlightClient:
                 count += 1
 
             for frame in frames:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 if recorder is None:
                     recorder = _open_recorder(frame)
                 if is_video:
@@ -424,8 +380,89 @@ class MoonlightClient:
 
         self._stream_manager = manager
 
+    def capture(self, output: str | Path) -> Path:
+        """Capture a single screenshot from the active stream.
+
+        Grabs the latest frame immediately (no waiting for a new one).
+        Requires an active stream via start_stream().
+
+        Args:
+            output: Output image file path (e.g. "screenshot.png").
+
+        Returns:
+            Path to the saved image file.
+        """
+        self._require_stream("capture")
+        frame = self._stream_manager.latest_frame
+        if frame is None:
+            raise StreamingError("No frame available yet")
+
+        from PIL import Image
+
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rgb = frame.data[:, :, ::-1]
+        Image.fromarray(rgb).save(output_path)
+        return output_path
+
+    def start_recording(self, output: str | Path) -> None:
+        """Start background recording to a video file or image directory.
+
+        Requires an active stream via start_stream(). Recording runs in
+        a background thread until stop_recording() is called.
+
+        Args:
+            output: Output file path (.mp4, .mkv, etc.) or directory for images.
+        """
+        self._require_stream("start_recording")
+        if self._recording_thread is not None:
+            raise StreamingError(
+                "Recording already in progress. Call stop_recording() first."
+            )
+
+        fps = self._stream_manager.fps
+        output_path = Path(output)
+        video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+        is_video = output_path.suffix.lower() in video_extensions
+
+        first_frame = self._stream_manager.latest_frame
+        sub = self._stream_manager.subscribe()
+        self._recording_stop = threading.Event()
+        self._recording_sub = sub
+        self._recording_error: BaseException | None = None
+
+        def _record() -> None:
+            try:
+                self._record_from_frames(
+                    sub, output_path, is_video, fps,
+                    duration=None, max_frames=None,
+                    first_frame=first_frame,
+                    stop_event=self._recording_stop,
+                )
+            except Exception as exc:
+                self._recording_error = exc
+
+        self._recording_thread = threading.Thread(target=_record, daemon=True)
+        self._recording_thread.start()
+
+    def stop_recording(self) -> None:
+        """Stop the background recording started by start_recording()."""
+        if self._recording_thread is None:
+            return
+        self._recording_stop.set()
+        self._recording_thread.join(timeout=10.0)
+        if self._recording_sub is not None:
+            self._stream_manager.unsubscribe(self._recording_sub)
+            self._recording_sub = None
+        self._recording_thread = None
+        if self._recording_error is not None:
+            err = self._recording_error
+            self._recording_error = None
+            raise StreamingError(f"Recording failed: {err}") from err
+
     def stop_stream(self) -> None:
         """Stop the persistent shared stream and clean up."""
+        self.stop_recording()
         if self._stream_manager is not None:
             self._stream_manager.stop()
             self._stream_manager = None
@@ -535,6 +572,48 @@ class MoonlightClient:
         self._decoder = decoder
 
         return session, decoder
+
+    def streaming(self, app: str = "Desktop", width: int = 1920,
+                  height: int = 1080, fps: int = 30,
+                  bitrate_kbps: int = 10000, codec: str = "h264",
+                  output_format: str = "bgr24",
+                  ready_timeout: float = 10.0,
+                  black_frame_threshold: float = 5.0):
+        """Context manager for start_stream() / stop_stream().
+
+        Usage::
+
+            with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+                client.capture("shot.png")
+                client.record("clip.mp4", duration=5)
+
+        Args:
+            Same as start_stream().
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            self.start_stream(
+                app=app, width=width, height=height, fps=fps,
+                bitrate_kbps=bitrate_kbps, codec=codec,
+                output_format=output_format,
+                ready_timeout=ready_timeout,
+                black_frame_threshold=black_frame_threshold,
+            )
+            try:
+                yield self
+            finally:
+                self.stop_stream()
+
+        return _ctx()
+
+    def _require_stream(self, method: str) -> None:
+        """Raise StreamNotActiveError if no shared stream is active."""
+        if self._stream_manager is None or not self._stream_manager.is_running:
+            raise StreamNotActiveError(
+                f"{method}() requires an active stream. Call start_stream() first."
+            )
 
     def _get_http(self, server: ServerInfo | None = None) -> NvHTTP:
         if server is not None:

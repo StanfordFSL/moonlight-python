@@ -46,11 +46,14 @@ class ImageRecorder:
         Image.fromarray(rgb).save(path)
         return path
 
+    def close(self) -> None:
+        """No-op for API compatibility with VideoRecorder."""
+
     def __enter__(self) -> ImageRecorder:
         return self
 
     def __exit__(self, *args: object) -> None:
-        pass
+        self.close()
 
 
 class VideoRecorder:

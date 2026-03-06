@@ -57,10 +57,10 @@ server = client.connect("192.168.1.100")
 client.pair()
 
 # Stream frames
-for frame in client.stream(app="Desktop", width=1920, height=1080, fps=30):
-    print(f"Frame {frame.frame_number}: {frame.width}x{frame.height}")
-    rgb_array = frame.data[:, :, ::-1]  # BGR to RGB
-    break  # just one frame for demo
+with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+    for frame in client.stream():
+        print(f"Frame {frame.frame_number}: {frame.width}x{frame.height}")
+        break  # just one frame for demo
 ```
 
 ## Usage
@@ -101,62 +101,25 @@ for app in client.apps():
     print(f"[{app.id}] {app.name}")
 ```
 
-### Stream Frames
+### Start a Stream
 
-`stream()` is a generator that yields `Frame` objects. Each frame contains a numpy array and metadata from the encoder.
-
-```python
-for frame in client.stream(app="Desktop", width=1280, height=720, fps=30):
-    # frame.data  — numpy array (H, W, 3) uint8, BGR format by default
-    # frame.frame_number, frame.timestamp_us, frame.is_keyframe, etc.
-    do_something(frame.data)
-```
-
-**Parameters:**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `app` | `"Desktop"` | Application name to stream |
-| `width` | `1920` | Video width in pixels |
-| `height` | `1080` | Video height in pixels |
-| `fps` | `30` | Frames per second |
-| `bitrate_kbps` | `10000` | Bitrate in kbps |
-| `codec` | `"h264"` | Video codec: `"h264"`, `"hevc"`, or `"av1"` |
-| `output_format` | `"bgr24"` | Pixel format: `"bgr24"` or `"rgb24"` |
-
-### Persistent Shared Stream
-
-Use `start_stream()` to establish a single persistent connection. `record()` requires an active stream via `start_stream()`. `stream()` and `latest_frame()` can also tap into the shared connection when one is active.
+All operations (`stream()`, `record()`, `capture()`, `latest_frame()`) require an active stream. Use `start_stream()` to establish the connection, or the `streaming()` context manager for automatic cleanup.
 
 ```python
-client.connect("192.168.1.100")
-
-# Start a persistent stream — blocks until real (non-black) frames are flowing
+# Option A: explicit start/stop
 client.start_stream(app="Desktop", width=1920, height=1080, fps=30)
-
-# Record from the active stream (no new connection, accurate duration)
-client.record("capture.mp4", duration=5)       # exactly 5 seconds
-
-# Iterate frames from the active stream
-for frame in client.stream():
-    process(frame.data)
-
-# Get the latest frame for CV pipelines
-with client.latest_frame() as buf:
-    frame = buf.get(timeout=1.0)
-
-# Explicit cleanup (also auto-cleans on exit)
+# ... use stream, record, capture, latest_frame ...
 client.stop_stream()
+
+# Option B: context manager (auto-stops on exit)
+with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+    client.capture("screenshot.png")
+    client.record("clip.mp4", duration=5)
 ```
 
-`start_stream()` solves three problems compared to letting each method create its own connection:
+`start_stream()` blocks until real (non-black) frames are flowing. It also requests an IDR frame and sends a mouse nudge to force Sunshine to produce frames immediately, even when joining an existing session.
 
-1. **No duplicate connections** — a second RTSP connection can disrupt an existing Sunshine session. With a shared stream, `record()` and `stream()` tap into the same connection.
-2. **Accurate recording duration** — recordings use wall-clock timestamps, so dropped frames create real time gaps rather than being silently compressed.
-3. **No black frames** — `start_stream()` waits for real (non-black) frames before returning, so consumers only see actual content.
-4. **Immediate frames** — an IDR frame is requested on start, so frames arrive immediately even when joining an existing Sunshine session.
-
-**`start_stream()` parameters:**
+**`start_stream()` / `streaming()` parameters:**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -170,40 +133,63 @@ client.stop_stream()
 | `ready_timeout` | `10.0` | Max seconds to wait for non-black frames |
 | `black_frame_threshold` | `5.0` | Mean pixel value above which a frame is considered real |
 
-**Note:** `record()` requires `start_stream()` to be called first. `stream()` and `latest_frame()` can still create their own connections if no shared stream is active.
+### Stream Frames
+
+`stream()` is a generator that yields `Frame` objects:
+
+```python
+for frame in client.stream():
+    # frame.data  — numpy array (H, W, 3) uint8, BGR format by default
+    do_something(frame.data)
+```
 
 ### Latest Frame Buffer (for CV Pipelines)
 
-If your model processes frames slower than the stream produces them, use `latest_frame()`. It runs the stream in a background thread and always gives you the most recent frame, dropping old ones.
+If your model processes frames slower than the stream produces them, use `latest_frame()`. It always gives you the most recent frame, dropping old ones.
 
 ```python
-with client.latest_frame(app="Desktop", width=1280, height=720, fps=30) as buf:
+with client.latest_frame() as buf:
     while True:
         frame = buf.get(timeout=1.0)
         if frame is None:
             continue
-        # frame.data is always the freshest available frame
         result = my_model(frame.data)
-        print(f"Processed frame {frame.frame_number}, "
-              f"dropped {buf.stats['frames_dropped']} frames")
+```
+
+### Screenshot
+
+Capture a single screenshot (grabs the latest frame immediately):
+
+```python
+client.capture("screenshot.png")
 ```
 
 ### Recording
 
-Record to a video file or a directory of images. The output format is auto-detected from the path. **Requires `start_stream()` first.**
+Record to a video file or a directory of images. The output format is auto-detected from the path.
 
-Recordings use wall-clock timestamps — dropped frames create real time gaps rather than being silently compressed.
+Recordings use wall-clock timestamps — dropped frames create real time gaps rather than being silently compressed. Video resolution matches the stream automatically.
 
 ```python
-client.start_stream(app="Desktop", width=1920, height=1080, fps=30)
-
 # Record 60 seconds of video
 client.record("capture.mp4", duration=60)
 
 # Record 100 frames as PNGs
 client.record("./frames/", max_frames=100)
+```
 
-client.stop_stream()
+### Background Recording
+
+Use `start_recording()` / `stop_recording()` to record in the background while running other code:
+
+```python
+client.start_recording("capture.mp4")
+
+# ... do other work, process frames, etc. ...
+time.sleep(10)
+
+# Stop recording — finalizes the video file
+client.stop_recording()
 ```
 
 You can also use the recorder classes directly for more control:
@@ -213,14 +199,14 @@ from moonlight_python import VideoRecorder, ImageRecorder
 
 # Video
 with VideoRecorder("output.mp4", 1920, 1080, fps=30) as rec:
-    for frame in client.stream(app="Desktop"):
+    for frame in client.stream():
         rec.write(frame)
         if some_condition:
             break
 
 # Images
 with ImageRecorder("./captures/", format="png") as rec:
-    for frame in client.stream(app="Desktop"):
+    for frame in client.stream():
         path = rec.write(frame)  # returns Path to saved file
 ```
 
@@ -257,21 +243,22 @@ from moonlight_python import MoonlightClient
 client = MoonlightClient()
 client.connect("192.168.1.100")
 
-with client.latest_frame(app="Desktop", width=1280, height=720, fps=30) as buf:
-    while True:
-        frame = buf.get(timeout=2.0)
-        if frame is None:
-            print("Waiting for frames...")
-            continue
+with client.streaming(app="Desktop", width=1280, height=720, fps=30):
+    with client.latest_frame() as buf:
+        while True:
+            frame = buf.get(timeout=2.0)
+            if frame is None:
+                print("Waiting for frames...")
+                continue
 
-        # Your CV model here
-        detections = yolo_model(frame.data)
+            # Your CV model here
+            detections = yolo_model(frame.data)
 
-        for det in detections:
-            print(f"[Frame {frame.frame_number}] {det.label}: {det.confidence:.2f}")
+            for det in detections:
+                print(f"[Frame {frame.frame_number}] {det.label}: {det.confidence:.2f}")
 ```
 
-## Full Example: Shared Stream with Recording
+## Full Example: Record While Processing
 
 ```python
 from moonlight_python import MoonlightClient
@@ -279,22 +266,20 @@ from moonlight_python import MoonlightClient
 client = MoonlightClient()
 client.connect("192.168.1.100")
 
-# Start a persistent stream (blocks until real frames arrive)
-client.start_stream(app="Desktop", width=1920, height=1080, fps=30)
+with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+    # Capture a screenshot
+    client.capture("screenshot.png")
 
-# Record exactly 10 seconds — duration is accurate because the stream is warm
-client.record("clip.mp4", duration=10)
+    # Record exactly 10 seconds
+    client.record("clip.mp4", duration=10)
 
-# Record 50 frames as images
-client.record("./frames/", max_frames=50)
-
-# Also iterate frames for real-time processing
-for frame in client.stream():
-    result = my_model(frame.data)
-    if done:
-        break
-
-client.stop_stream()
+    # Background recording while doing other work
+    client.start_recording("long_capture.mp4")
+    for frame in client.stream():
+        result = my_model(frame.data)
+        if done:
+            break
+    client.stop_recording()
 ```
 
 ## Development

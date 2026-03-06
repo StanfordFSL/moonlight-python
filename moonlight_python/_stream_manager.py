@@ -169,6 +169,10 @@ class StreamManager:
             return self._latest_frame
 
     @property
+    def fps(self) -> int:
+        return self._fps
+
+    @property
     def is_running(self) -> bool:
         return self._running and self._thread is not None and self._thread.is_alive()
 

@@ -17,7 +17,7 @@ client = MoonlightClient()
 client.connect("192.168.1.100")
 client.pair()
 
-with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+with client.stream(app="Desktop", width=1920, height=1080, fps=30):
     client.capture("screenshot.png")          # single screenshot
     client.record("capture.mp4", duration=5)  # record 5 seconds
     client.start_recording("long.mp4")        # background recording

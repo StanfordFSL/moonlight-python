@@ -11,8 +11,8 @@ Usage::
     server = client.connect("192.168.1.X")
     client.pair()
 
-    with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
-        for frame in client.stream():
+    with client.stream(app="Desktop", width=1920, height=1080, fps=30):
+        for frame in client.frames():
             # frame.data is numpy array (H, W, 3) uint8 BGR
             result = my_cv_model(frame.data)
 """
@@ -221,7 +221,7 @@ class MoonlightClient:
         http = self._get_http(server)
         return http.get_app_list()
 
-    def stream(self) -> Iterator[Frame]:
+    def frames(self) -> Iterator[Frame]:
         """Yield decoded video frames from the active stream.
 
         Requires an active stream via start_stream().
@@ -229,7 +229,7 @@ class MoonlightClient:
         Yields:
             Frame objects with .data as numpy array (H, W, 3) uint8
         """
-        self._require_stream("stream")
+        self._require_stream("frames")
         sub = self._stream_manager.subscribe()
         try:
             yield from sub
@@ -270,9 +270,17 @@ class MoonlightClient:
 
         Args:
             output: Output file path or directory.
-            duration: Max recording duration in seconds (None = unlimited).
-            max_frames: Max number of frames to record (None = unlimited).
+            duration: Max recording duration in seconds.
+            max_frames: Max number of frames to record.
+
+        At least one of duration or max_frames must be provided.
+        Use start_recording() / stop_recording() for open-ended recording.
         """
+        if duration is None and max_frames is None:
+            raise ValueError(
+                "record() requires duration or max_frames. "
+                "Use start_recording() / stop_recording() for open-ended recording."
+            )
         self._require_stream("record")
         fps = self._stream_manager.fps
 
@@ -573,17 +581,17 @@ class MoonlightClient:
 
         return session, decoder
 
-    def streaming(self, app: str = "Desktop", width: int = 1920,
-                  height: int = 1080, fps: int = 30,
-                  bitrate_kbps: int = 10000, codec: str = "h264",
-                  output_format: str = "bgr24",
-                  ready_timeout: float = 10.0,
-                  black_frame_threshold: float = 5.0):
+    def stream(self, app: str = "Desktop", width: int = 1920,
+               height: int = 1080, fps: int = 30,
+               bitrate_kbps: int = 10000, codec: str = "h264",
+               output_format: str = "bgr24",
+               ready_timeout: float = 10.0,
+               black_frame_threshold: float = 5.0):
         """Context manager for start_stream() / stop_stream().
 
         Usage::
 
-            with client.streaming(app="Desktop", width=1920, height=1080, fps=30):
+            with client.stream(app="Desktop", width=1920, height=1080, fps=30):
                 client.capture("shot.png")
                 client.record("clip.mp4", duration=5)
 

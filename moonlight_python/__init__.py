@@ -146,7 +146,11 @@ class MoonlightClient:
         return discover_servers(self._identity, timeout)
 
     def connect(self, host: str, port: int = 47989) -> ServerInfo:
-        """Connect to a specific host and fetch server info.
+        """Connect to a specific host, auto-pairing if needed.
+
+        If this client has not been paired with the server before, a random
+        PIN is generated and printed for the user to enter in the Sunshine
+        web UI. The method blocks until pairing completes.
 
         Args:
             host: IP address or hostname
@@ -165,6 +169,10 @@ class MoonlightClient:
             https_port=server.https_port,
             server_cert_pem=server.server_cert_pem,
         )
+
+        if not server.paired:
+            self.pair()
+
         return server
 
     def pair(self, server: ServerInfo | None = None,

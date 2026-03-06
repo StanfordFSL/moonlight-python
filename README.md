@@ -49,8 +49,7 @@ The resulting `.whl` files will be in `wheelhouse/`.
 from moonlight_python import MoonlightClient
 
 client = MoonlightClient()
-client.connect("192.168.1.100")
-client.pair()  # first time only — enter the PIN in Sunshine web UI
+client.connect("192.168.1.100")  # auto-pairs on first connection
 
 with client.stream(app="Desktop", width=1920, height=1080, fps=30):
     # Capture a screenshot
@@ -217,13 +216,13 @@ server = client.connect("192.168.1.100", port=48089)  # custom port
 
 Pairing is required once per client identity. The identity (RSA key + certificate) is persisted in `~/.moonlight-python/`.
 
-```python
-# Auto-generates a random PIN and prints it
-client.pair()
-# Output: PIN: 4829
-#         Enter this PIN in the Sunshine web UI at https://192.168.1.100:47990
+`connect()` automatically detects whether the client is paired and triggers pairing if needed — a random PIN is printed for you to enter in the Sunshine web UI. You can also pair explicitly or with a specific PIN:
 
-# Or specify a PIN explicitly
+```python
+# Explicit pairing (not usually needed — connect() handles this)
+client.pair()
+
+# Pair with a specific PIN
 client.pair(pin="1234")
 ```
 

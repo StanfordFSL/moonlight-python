@@ -14,8 +14,7 @@ pip install moonlight-python
 from moonlight_python import MoonlightClient
 
 client = MoonlightClient()
-client.connect("192.168.1.100")
-client.pair()
+client.connect("192.168.1.100")  # auto-pairs on first connection
 
 with client.stream(app="Desktop", width=1920, height=1080, fps=30):
     client.capture("screenshot.png")          # single screenshot

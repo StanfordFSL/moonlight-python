@@ -65,6 +65,12 @@ with client.stream(app="Desktop", width=1920, height=1080, fps=30):
         result = my_model(frame.data)
         if done:
             break
+
+    # Always get the most recent frame (drops old ones)
+    with client.latest_frame() as buf:
+        frame = buf.get(timeout=1.0)
+        if frame is not None:
+            result = my_model(frame.data)
 ```
 
 ## Usage
@@ -129,8 +135,17 @@ Recordings use wall-clock timestamps — dropped frames create real time gaps ra
 # Record 60 seconds of video
 client.record("capture.mp4", duration=60)
 
+# Record exactly 100 frames of video
+client.record("capture.mp4", max_frames=100)
+
+# Record 30 seconds but stop early if 500 frames are reached
+client.record("capture.mp4", duration=30, max_frames=500)
+
 # Record 100 frames as PNGs
 client.record("./frames/", max_frames=100)
+
+# Record 10 seconds of PNGs
+client.record("./frames/", duration=10)
 ```
 
 ### Background Recording
@@ -138,11 +153,15 @@ client.record("./frames/", max_frames=100)
 Use `start_recording()` / `stop_recording()` for open-ended recording that runs in the background while you do other work:
 
 ```python
+# Record video in the background
 client.start_recording("capture.mp4")
-
 # ... process frames, run models, etc. ...
-
 client.stop_recording()  # finalizes the video file
+
+# Record images in the background
+client.start_recording("./frames/")
+# ... do other work ...
+client.stop_recording()
 ```
 
 ### Latest Frame (for CV Pipelines)

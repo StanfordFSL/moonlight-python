@@ -25,7 +25,7 @@ Pre-built wheels are available — no compiler or system dependencies needed.
 > **Supported platforms for pre-built wheels (Python 3.10–3.14):**
 > | OS | Architecture |
 > |---|---|
-> | Linux | x86_64 |
+> | Linux | x86_64, aarch64 |
 > | Windows | amd64 |
 > | macOS | arm64, x86_64 |
 >

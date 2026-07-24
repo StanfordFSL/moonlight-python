@@ -17,6 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0        # full history + all tags for setuptools-scm
 
       - name: Set up QEMU for aarch64 emulation
         if: runner.os == 'Linux'
@@ -76,6 +77,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0        # full history + all tags for setuptools-scm
 
       - uses: actions/setup-python@v5
         with:

@@ -54,7 +54,15 @@ from .server import AppInfo, ServerInfo
 from ._stream_manager import StreamManager
 from .stream import StreamingSession
 
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("moonlight-python")
+except PackageNotFoundError:  # running from a bare source tree, not installed
+    __version__ = "0.0.0+unknown"
+
 __all__ = [
+    "__version__",
     "MoonlightClient",
     "ServerInfo",
     "AppInfo",

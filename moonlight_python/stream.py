@@ -259,6 +259,9 @@ class StreamingSession:
         self._capture_audio = False
         self._audio_queue: "queue.Queue[RawAudioPacket | None] | None" = None
         self._audio_frame_index = 0
+        self._audio_lost_packets = 0
+        self._audio_dropped_packets = 0
+        self._audio_callback_errors = 0
         self.opus_config: OpusConfig | None = None
         self._opus_config_event = threading.Event()
 
@@ -365,20 +368,18 @@ class StreamingSession:
         def audio_decode_and_play(sample_data, sample_length):  # noqa: ANN001
             # Runs on the RTP receive thread — keep minimal, never block, and
             # never raise into C. Copy the buffer immediately (it is only valid
-            # for the duration of this call), then enqueue.
+            # for the duration of this call), then hand off.
             try:
-                if sample_length <= 0 or self._audio_queue is None:
-                    return
-                data = bytes(self._ffi.buffer(sample_data, sample_length))
-                pkt = RawAudioPacket(
-                    opus_data=data,
-                    frame_index=self._audio_frame_index,
-                    receive_time_us=int(time.monotonic() * 1_000_000),
-                )
-                self._audio_frame_index += 1
-                self._enqueue_audio(pkt)
+                # sample_length <= 0 is moonlight-common-c's packet-loss signal,
+                # and sample_data is NULL in that case, so test the length first.
+                if sample_length <= 0:
+                    self._on_audio_sample(None)
+                else:
+                    self._on_audio_sample(
+                        bytes(self._ffi.buffer(sample_data, sample_length))
+                    )
             except Exception:
-                pass
+                self._audio_callback_errors += 1
 
         self._callbacks.extend(
             [audio_init, audio_start, audio_stop, audio_cleanup, audio_decode_and_play]
@@ -392,14 +393,44 @@ class StreamingSession:
 
         return ar
 
+    def _on_audio_sample(self, data: bytes | None) -> None:
+        """Ingest one audio packet. Called from the CFFI callback.
+
+        ``data is None`` is moonlight-common-c's packet-loss-concealment signal
+        (``decodeAndPlaySample(NULL, 0)``, AudioStream.c). PyAV exposes no way to
+        run real Opus PLC — a zero-length packet means *drain* to avcodec, not
+        *conceal* — so no PCM is produced. The frame index must still advance:
+        it is the audio timeline, and skipping it would delete the lost packet's
+        duration from the recording and pull all later audio earlier. Consumers
+        see the resulting index gap and fill it with silence.
+        """
+        if self._audio_queue is None:
+            return
+        index = self._audio_frame_index
+        self._audio_frame_index += 1
+        if data is None:
+            self._audio_lost_packets += 1
+            return
+        self._enqueue_audio(RawAudioPacket(
+            opus_data=data,
+            frame_index=index,
+            receive_time_us=int(time.perf_counter() * 1_000_000),
+        ))
+
     def _enqueue_audio(self, pkt: "RawAudioPacket") -> None:
-        """Enqueue an audio packet, dropping the oldest on overflow."""
+        """Enqueue an audio packet, dropping the oldest on overflow.
+
+        A dropped packet leaves a gap in the ``frame_index`` sequence that
+        downstream consumers fill with silence, so overflow costs audio content
+        but never shifts the audio timeline.
+        """
         q = self._audio_queue
         if q is None:
             return
         try:
             q.put_nowait(pkt)
         except queue.Full:
+            self._audio_dropped_packets += 1
             try:
                 q.get_nowait()
             except queue.Empty:
@@ -408,6 +439,15 @@ class StreamingSession:
                 q.put_nowait(pkt)
             except queue.Full:
                 pass
+
+    @property
+    def audio_loss_stats(self) -> dict[str, int]:
+        """Counts of audio packets that never reached the decoder."""
+        return {
+            "lost": self._audio_lost_packets,        # missing on the network
+            "dropped": self._audio_dropped_packets,  # queue overflow
+            "callback_errors": self._audio_callback_errors,
+        }
 
     def start(self, address: str, app_version: str, gfe_version: str,
               server_codec_mode_support: int, rtsp_session_url: str,

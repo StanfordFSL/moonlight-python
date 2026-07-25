@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import atexit
+import logging
 import random
 import secrets
 import threading
@@ -53,6 +54,18 @@ from .recorder import ImageRecorder, VideoRecorder
 from .server import AppInfo, ServerInfo
 from ._stream_manager import StreamManager
 from .stream import StreamingSession
+
+log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler())
+
+# How long to keep pulling in-flight audio after the video loop ends. The audio
+# pipeline (jitter buffer -> raw queue -> decode thread -> subscription queue)
+# runs behind video, so stopping both at once truncates the audio track.
+_AUDIO_DRAIN_TIMEOUT = 2.0
+# Treat the queue as drained after this long with nothing arriving.
+_AUDIO_DRAIN_IDLE = 0.25
+# Consecutive write failures tolerated before the feeder gives up.
+_AUDIO_MAX_ERRORS = 10
 
 try:
     from importlib.metadata import PackageNotFoundError, version as _pkg_version
@@ -414,6 +427,7 @@ class MoonlightClient:
                 audio_sub=audio_sub,
                 sample_rate=self._stream_manager.audio_sample_rate,
                 channels=self._stream_manager.audio_channels,
+                samples_per_frame=self._stream_manager.audio_samples_per_frame,
             )
         finally:
             self._stream_manager.unsubscribe(sub)
@@ -433,19 +447,27 @@ class MoonlightClient:
         audio_sub=None,
         sample_rate: int = 48000,
         channels: int = 2,
+        samples_per_frame: int = 0,
     ) -> None:
         """Record frames from any iterator to the given output path.
 
         When ``audio_sub`` is provided, a companion feeder thread drains
         decoded audio chunks in parallel: into the video container as an AAC
-        track (video mode), or into ``<dir>/audio.wav`` (image mode). Both use
-        the same recording start so audio and video stay in sync.
+        track (video mode), or into ``<dir>/audio.wav`` (image mode).
+
+        Video is timestamped from each frame's capture time and audio from the
+        host's Opus packet count, so the two tracks share the host's clock and
+        cannot drift apart. When the video loop ends, the feeder is given a
+        bounded window to flush audio that is still in flight rather than being
+        killed outright.
         """
         count = 0
-        start_time = time.monotonic()
+        start_time = time.perf_counter()
+        video_epoch_us: int | None = None
         recorder = None
         wav = None
-        audio_stop = threading.Event()
+        audio_stop = threading.Event()   # hard kill
+        audio_drain = threading.Event()  # video finished; flush what is left
         audio_thread: threading.Thread | None = None
         use_audio = audio_sub is not None
 
@@ -453,41 +475,97 @@ class MoonlightClient:
             if is_video:
                 h, w = frame.data.shape[:2]
                 return VideoRecorder(output_path, w, h, fps, audio=use_audio,
-                                     sample_rate=sample_rate, channels=channels)
+                                     sample_rate=sample_rate, channels=channels,
+                                     samples_per_frame=samples_per_frame)
             return ImageRecorder(output_path)
 
         def _audio_feed(target, is_wav: bool) -> None:
+            errors = 0
+            idle_since: float | None = None
+            deadline: float | None = None
             while not audio_stop.is_set():
-                chunk = audio_sub.get(timeout=0.5)
+                if audio_drain.is_set() and deadline is None:
+                    deadline = time.perf_counter() + _AUDIO_DRAIN_TIMEOUT
+                chunk = audio_sub.get(timeout=0.1)
                 if chunk is None:
+                    if not audio_drain.is_set():
+                        continue
+                    if getattr(audio_sub, "is_closed", False):
+                        return
+                    now = time.perf_counter()
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= _AUDIO_DRAIN_IDLE or now > deadline:
+                        return
                     continue
+                idle_since = None
                 try:
                     if is_wav:
                         target.write(chunk)
                     else:
                         target.write_audio(chunk)
+                    errors = 0
                 except Exception:
-                    break
+                    errors += 1
+                    log.exception("Audio write failed at frame_index=%s",
+                                  getattr(chunk, "frame_index", "?"))
+                    if errors >= _AUDIO_MAX_ERRORS:
+                        log.error("Giving up on audio after %d consecutive failures",
+                                  errors)
+                        return
+                # Once the video has stopped, there is no point pulling audio
+                # past the end of the video timeline.
+                if (audio_drain.is_set() and not is_wav
+                        and target.audio_position_us >= target.last_video_us):
+                    return
 
         def _start_audio_feeder() -> None:
             nonlocal audio_thread, wav
             if not use_audio or audio_thread is not None:
                 return
+            # Discard anything the subscription buffered before the recording
+            # started — up to a second of stale audio that would otherwise be
+            # laid down at PTS 0 and make audio lead video for the whole file.
+            while audio_sub.get(timeout=0.0) is not None:
+                pass
             if is_video:
                 audio_thread = threading.Thread(
                     target=_audio_feed, args=(recorder, False), daemon=True)
             else:
-                wav = WavRecorder(output_path / "audio.wav", sample_rate, channels)
+                wav = WavRecorder(output_path / "audio.wav", sample_rate, channels,
+                                  samples_per_frame=samples_per_frame)
                 audio_thread = threading.Thread(
                     target=_audio_feed, args=(wav, True), daemon=True)
             audio_thread.start()
+
+        def _video_pts_us(frame: Frame) -> int:
+            """Capture-relative PTS in microseconds, from the host's clock.
+
+            ``Frame.timestamp_us`` is moonlight's ``presentationTimeUs``, whose
+            epoch is the first captured frame of the session. Using it instead of
+            the time this thread happened to dequeue the frame keeps encoder
+            backlog from showing up as a stretched video timeline.
+            """
+            nonlocal video_epoch_us
+            ts = frame.timestamp_us
+            if video_epoch_us is None:
+                video_epoch_us = ts
+                return 0
+            if ts > video_epoch_us:
+                return ts - video_epoch_us
+            # No usable host PTS for this frame (moonlight leaves it zero when it
+            # has nothing to synthesize from) — fall back to the local clock.
+            return int((time.perf_counter() - start_time) * 1_000_000)
 
         try:
             # Write the latest frame as the first frame (avoids black start)
             if first_frame is not None:
                 recorder = _open_recorder(first_frame)
                 if is_video:
-                    recorder.write(first_frame, pts=0)
+                    # Anchor the video timeline here; later frames are measured
+                    # against this frame's capture time.
+                    video_epoch_us = first_frame.timestamp_us
+                    recorder.write(first_frame, pts_us=0)
                 else:
                     recorder.write(first_frame)
                 count += 1
@@ -500,19 +578,26 @@ class MoonlightClient:
                     recorder = _open_recorder(frame)
                     _start_audio_feeder()
                 if is_video:
-                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                    recorder.write(frame, pts=elapsed_ms)
+                    recorder.write(frame, pts_us=_video_pts_us(frame))
                 else:
                     recorder.write(frame)
                 count += 1
                 if max_frames is not None and count >= max_frames:
                     break
-                if duration is not None and (time.monotonic() - start_time) >= duration:
+                if duration is not None and (time.perf_counter() - start_time) >= duration:
                     break
         finally:
-            audio_stop.set()
+            # Let the feeder flush in-flight audio before tearing down, so the
+            # recording does not end with video that has no audio under it.
             if audio_thread is not None:
-                audio_thread.join(timeout=5.0)
+                audio_drain.set()
+                audio_thread.join(timeout=_AUDIO_DRAIN_TIMEOUT + 1.0)
+                if audio_thread.is_alive():
+                    log.warning("Audio feeder did not drain within %.1fs; "
+                                "the tail will be padded with silence",
+                                _AUDIO_DRAIN_TIMEOUT)
+                    audio_stop.set()
+                    audio_thread.join(timeout=2.0)
             if wav is not None:
                 wav.close()
             if recorder is not None:
@@ -616,6 +701,7 @@ class MoonlightClient:
         audio_sub = self._stream_manager.subscribe_audio() if use_audio else None
         sample_rate = self._stream_manager.audio_sample_rate
         channels = self._stream_manager.audio_channels
+        samples_per_frame = self._stream_manager.audio_samples_per_frame
         self._recording_stop = threading.Event()
         self._recording_sub = sub
         self._recording_audio_sub = audio_sub
@@ -631,6 +717,7 @@ class MoonlightClient:
                     audio_sub=audio_sub,
                     sample_rate=sample_rate,
                     channels=channels,
+                    samples_per_frame=samples_per_frame,
                 )
             except Exception as exc:
                 self._recording_error = exc

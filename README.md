@@ -145,13 +145,29 @@ client.capture("screenshot.png")
 
 Record to a video file or a directory of images. The output format is auto-detected from the file extension (`.mp4`, `.mkv`, `.avi`, `.mov`, `.webm` → video, otherwise → image directory). At least one of `duration` or `max_frames` is required.
 
-Recordings use wall-clock timestamps — dropped frames create real time gaps rather than being silently compressed. Video resolution matches the stream automatically.
+Recordings are timestamped from the host's capture clock — dropped frames create real time gaps rather than being silently compressed, so a variable frame rate is recorded faithfully. Video resolution matches the stream automatically.
 
 **Audio** is included automatically when the stream was started with `record_audio=True` (the default):
 - **Video files** get a synced AAC audio track baked into the same container.
 - **Image directories** get a separate `audio.wav` (16-bit PCM) written alongside the frames.
 
 Pass `with_audio=False` to `record()` / `start_recording()` to skip audio for a specific recording.
+
+#### How A/V sync is maintained
+
+Both tracks are placed on the **host's** clock, so they cannot drift apart over a long recording:
+
+- **Video** PTS come from each frame's capture timestamp (moonlight's `presentationTimeUs`), in a 90 kHz time base.
+- **Audio** is positioned at `frame_index × samples_per_frame` — a count of the Opus packets the host generated, not a running total of the samples that happened to arrive.
+
+Because audio is positioned rather than appended, anything lost upstream — a packet dropped by the network, a full queue, a corrupt packet — leaves a **gap filled with silence** instead of pulling all subsequent audio earlier. On stop, the recorder drains audio still in flight (the audio pipeline runs behind video) and pads any remainder with silence so both tracks end together.
+
+Losses are reported at `INFO` level; enable logging to see them:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
 
 ```python
 # Record 60 seconds of video
@@ -326,8 +342,17 @@ with VideoRecorder("output.mp4", 1920, 1080, fps=30) as rec:
 
 # Video with a synced AAC audio track
 with VideoRecorder("output.mp4", 1920, 1080, fps=30, audio=True) as rec:
-    rec.write(frame)         # from the video thread
-    rec.write_audio(chunk)   # from the audio thread (thread-safe)
+    # pts_us is the capture time in microseconds, relative to the recording
+    # start. Pass frame.timestamp_us - <first frame's timestamp_us>.
+    rec.write(frame, pts_us=elapsed_us)   # from the video thread
+    rec.write_audio(chunk)                # from the audio thread (thread-safe)
+```
+
+`write_audio()` positions each chunk using `chunk.frame_index`, so gaps caused by
+lost audio are filled with silence. If you build `AudioChunk`s yourself and leave
+`frame_index` at its default, chunks are simply appended in order.
+
+```python
 
 # Images
 with ImageRecorder("./captures/", format="png") as rec:

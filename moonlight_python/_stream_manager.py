@@ -6,6 +6,7 @@ and latest_frame() all tap into, avoiding duplicate RTSP connections.
 
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 import time
@@ -19,6 +20,8 @@ from .frame import Frame
 from .stream import StreamingSession, stream_frames
 from .decoder import Decoder
 from .exceptions import StreamingError
+
+log = logging.getLogger(__name__)
 
 
 def _is_real_frame(frame: Frame, threshold: float = 5.0) -> bool:
@@ -98,14 +101,25 @@ class AudioSubscription:
     def __init__(self, maxsize: int = 200) -> None:
         self._queue: queue.Queue[AudioChunk | None] = queue.Queue(maxsize=maxsize)
         self._closed = False
+        self.dropped = 0
 
     def put(self, chunk: AudioChunk) -> None:
-        """Called by StreamManager to deliver a chunk. Drops oldest on overflow."""
+        """Called by StreamManager to deliver a chunk. Drops oldest on overflow.
+
+        A dropped chunk leaves a gap in the ``frame_index`` sequence, which the
+        recorder fills with silence — content is lost but the timeline is not.
+        """
         if self._closed:
             return
         try:
             self._queue.put_nowait(chunk)
         except queue.Full:
+            self.dropped += 1
+            # Rate-limited so a sustained overrun doesn't flood the log.
+            if self.dropped in (1, 10, 100, 1000) or self.dropped % 10000 == 0:
+                log.warning("Audio consumer is falling behind: %d chunk(s) dropped; "
+                            "the recording will contain silence where they were",
+                            self.dropped)
             try:
                 self._queue.get_nowait()
             except queue.Empty:
@@ -114,6 +128,15 @@ class AudioSubscription:
                 self._queue.put_nowait(chunk)
             except queue.Full:
                 pass
+
+    @property
+    def is_closed(self) -> bool:
+        """True once the producer signalled end-of-stream.
+
+        ``get()`` returns None for both a timeout and a closed stream, so a
+        draining consumer needs this to tell the two apart.
+        """
+        return self._closed
 
     def get(self, timeout: float | None = None) -> AudioChunk | None:
         """Blocking get. Returns None on timeout or when stream ends."""
@@ -167,7 +190,11 @@ class StreamManager:
         self._ready_event = threading.Event()
         self._error: BaseException | None = None
         self._thread: threading.Thread | None = None
-        self._t0 = 0.0  # shared monotonic origin for A/V timestamps
+        # Shared monotonic origin for A/V timestamps. perf_counter() is backed by
+        # QueryPerformanceCounter on every supported Python version; monotonic()
+        # only became QPC-based in 3.13 and is quantized to 15.6 ms on Windows
+        # before that, which is coarse enough to disturb frame timing at 30 fps.
+        self._t0 = 0.0
 
         self._lock = threading.Lock()
         self._subscribers: list[FrameSubscription] = []
@@ -179,6 +206,7 @@ class StreamManager:
         self._audio_lock = threading.Lock()
         self._audio_subscribers: list[AudioSubscription] = []
         self._latest_audio: AudioChunk | None = None
+        self._audio_samples_per_frame = 240
 
     def start(self, ready_timeout: float = 10.0, black_frame_threshold: float = 5.0) -> None:
         """Start the background pull thread and block until real frames flow.
@@ -192,13 +220,14 @@ class StreamManager:
         """
         self._running = True
         self._black_frame_threshold = black_frame_threshold
-        self._t0 = time.monotonic()
+        self._t0 = time.perf_counter()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
         # Start the audio decode thread (does not gate readiness).
         if self._capture_audio:
             config = self._session.wait_for_opus_config(timeout=5.0)
+            self._audio_samples_per_frame = config.samples_per_frame or 240
             self._audio_decoder = AudioDecoder(
                 sample_rate=config.sample_rate,
                 channels=config.channel_count,
@@ -221,6 +250,21 @@ class StreamManager:
 
     def stop(self) -> None:
         """Stop the background threads and close all subscriptions."""
+        if self._capture_audio:
+            stats = dict(self._session.audio_loss_stats)
+            stats["decode_errors"] = (
+                self._audio_decoder.decode_errors if self._audio_decoder else 0
+            )
+            missing = sum(stats.values())
+            if missing:
+                ms = self._audio_samples_per_frame * 1000 // (self.audio_sample_rate or 1)
+                log.info(
+                    "Audio: %d packet(s) never reached the encoder (%s) — roughly "
+                    "%d ms replaced with silence to keep the timeline aligned",
+                    missing,
+                    ", ".join(f"{k}={v}" for k, v in stats.items() if v),
+                    missing * ms,
+                )
         self._running = False
         self._session.wake()
         self._session.wake_audio()
@@ -302,6 +346,24 @@ class StreamManager:
         return self._audio_decoder.channels if self._audio_decoder else 2
 
     @property
+    def audio_samples_per_frame(self) -> int:
+        """Samples per channel in one Opus packet, from the negotiated config.
+
+        Fixed for the life of the stream (CAPABILITY_SUPPORTS_ARBITRARY_AUDIO_DURATION
+        is not advertised), so ``frame_index * samples_per_frame`` reconstructs the
+        host's audio timeline across lost or dropped packets.
+
+        One caveat: moonlight-common-c emits a concealment callback per missing
+        packet, but when an *entire* FEC block is lost it resynchronizes by
+        advancing the sequence number without emitting placeholders
+        (``RtpAudioQueue.c``, "a previous FEC block was completely lost"). Each
+        such event is invisible here and under-counts by RTPA_DATA_SHARDS
+        packets (4 x 5 ms = 20 ms). Rare, bounded, and mopped up by the tail
+        padding in :meth:`VideoRecorder.close`.
+        """
+        return self._audio_samples_per_frame
+
+    @property
     def fps(self) -> int:
         return self._fps
 
@@ -365,7 +427,7 @@ class StreamManager:
                         break
                     continue
                 for arr in decoder.decode(pkt.opus_data):
-                    timestamp_us = int((time.monotonic() - self._t0) * 1_000_000)
+                    timestamp_us = int((time.perf_counter() - self._t0) * 1_000_000)
                     chunk = AudioChunk(
                         data=arr,
                         sample_rate=decoder.sample_rate,
@@ -379,7 +441,7 @@ class StreamManager:
                         for sub in self._audio_subscribers:
                             sub.put(chunk)
         except Exception:
-            pass
+            log.exception("Audio decode thread stopped early; audio will be truncated")
         finally:
             with self._audio_lock:
                 for sub in self._audio_subscribers:

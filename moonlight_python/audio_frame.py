@@ -15,10 +15,17 @@ class AudioChunk:
         data: Decoded PCM samples as (samples, channels) float32 in [-1.0, 1.0].
         sample_rate: Sample rate in Hz (48000 for Moonlight/Sunshine).
         channels: Number of audio channels.
-        timestamp_us: Presentation timestamp in microseconds, on the same
-            monotonic clock as video frames (for A/V sync).
-        receive_time_us: Wall-clock time the packet was received (microseconds).
-        frame_index: Sequential index of the source Opus packet.
+        timestamp_us: Microseconds since the stream started, stamped when the
+            decode thread processed this chunk. Useful for rough ordering, but
+            it carries queue and scheduling latency — it is *not* a capture
+            timestamp, and it is not on the same clock as ``Frame.timestamp_us``
+            (which comes from the host). Do not use it for A/V sync.
+        receive_time_us: perf_counter() microseconds at which the packet arrived,
+            stamped on the RTP receive thread. This is the capture-side timestamp.
+        frame_index: Sequential index of the source Opus packet. Advances for
+            packets lost on the network too, so ``frame_index * samples_per_frame``
+            is the chunk's position on the host's audio timeline — this is what
+            recorders use to keep audio aligned with video.
     """
 
     data: np.ndarray

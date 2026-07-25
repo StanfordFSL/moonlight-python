@@ -39,9 +39,11 @@ def _make_opus_packets(n_frames: int = 3, samples: int = 960,
     return packets
 
 
-def _make_chunk(samples: int = 960, channels: int = 2) -> AudioChunk:
+def _make_chunk(samples: int = 960, channels: int = 2,
+                frame_index: int = 0) -> AudioChunk:
     data = (0.1 * np.random.randn(samples, channels)).astype(np.float32)
-    return AudioChunk(data=data, sample_rate=48000, channels=channels)
+    return AudioChunk(data=data, sample_rate=48000, channels=channels,
+                      frame_index=frame_index)
 
 
 def _make_frame(width: int = 320, height: int = 240) -> Frame:
@@ -132,11 +134,14 @@ class TestWavRecorder:
 class TestVideoRecorderAudio:
     def test_two_streams(self, tmp_path: Path):
         out = tmp_path / "av.mp4"
+        # 6 frames at 10 fps = 600 ms of video, matched by 6 x 100 ms of audio.
         with VideoRecorder(out, 320, 240, fps=10, audio=True,
-                           sample_rate=48000, channels=2) as rec:
+                           sample_rate=48000, channels=2,
+                           samples_per_frame=4800) as rec:
             for i in range(6):
-                rec.write(_make_frame(), pts=int(i * 1000 / 10))
-                rec.write_audio(_make_chunk(samples=4800, channels=2))
+                rec.write(_make_frame(), pts_us=i * 100_000)
+                rec.write_audio(_make_chunk(samples=4800, channels=2,
+                                            frame_index=i))
         assert out.exists() and out.stat().st_size > 0
 
         c = av.open(str(out))

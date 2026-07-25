@@ -11,12 +11,15 @@ both stereo (channel mapping family 0) and surround (family 1) decode correctly.
 
 from __future__ import annotations
 
+import logging
 import struct
 
 import av
 import numpy as np
 
 from .exceptions import DecoderError
+
+log = logging.getLogger(__name__)
 
 
 def build_opus_head(sample_rate: int, channels: int, streams: int,
@@ -70,6 +73,7 @@ class AudioDecoder:
             sample_rate, channels, streams, coupled_streams, mapping
         )
         self._open = True
+        self._decode_errors = 0
 
     @property
     def sample_rate(self) -> int:
@@ -101,9 +105,17 @@ class AudioDecoder:
                 # Transpose to (samples, channels), contiguous float32
                 out.append(np.ascontiguousarray(arr.T, dtype=np.float32))
         except av.error.InvalidDataError:
-            # Corrupted packet — skip
-            pass
+            # Corrupted packet — skip. The packet's frame_index is simply never
+            # delivered, so recorders see the gap and fill it with silence
+            # rather than losing the time from the audio timeline.
+            self._decode_errors += 1
+            log.debug("Dropped a corrupt Opus packet (%d total)", self._decode_errors)
         return out
+
+    @property
+    def decode_errors(self) -> int:
+        """Number of packets that failed to decode."""
+        return self._decode_errors
 
     def close(self) -> None:
         """Close the decoder."""

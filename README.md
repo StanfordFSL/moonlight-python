@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/moonlight-python?v=1)](https://pypi.org/project/moonlight-python/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 
-Python client for [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/) game streaming. Receives decoded video frames as numpy arrays for computer vision and robotics pipelines.
+Python client for [Moonlight](https://moonlight-stream.org/) / [Sunshine](https://app.lizardbyte.dev/Sunshine/) game streaming. Receives decoded video frames as numpy arrays for computer vision and robotics pipelines, with optional synced audio capture.
 
 Built on [moonlight-common-c](https://github.com/moonlight-stream/moonlight-common-c) via CFFI and [PyAV](https://pyav.org/) (FFmpeg) for decoding.
 
@@ -75,6 +75,12 @@ with client.stream(app="Desktop", width=1920, height=1080, fps=30):
         if done:
             break
 
+    # Process audio in real time (48 kHz float32 PCM)
+    for chunk in client.audio():
+        # chunk.data is a numpy array (samples, channels) float32
+        process_audio(chunk.data)
+        break
+
     # Always get the most recent frame (drops old ones)
     with client.latest_frame() as buf:
         frame = buf.get(timeout=1.0)
@@ -115,6 +121,7 @@ client.stop_stream()
 | `output_format` | `"bgr24"` | Pixel format: `"bgr24"` or `"rgb24"` |
 | `ready_timeout` | `10.0` | Max seconds to wait for non-black frames |
 | `black_frame_threshold` | `5.0` | Mean pixel value above which a frame is considered real |
+| `record_audio` | `True` | Capture the audio stream. Enables `audio()` / `latest_audio()` and audio in `record()` |
 
 ### Iterating Frames
 
@@ -138,7 +145,29 @@ client.capture("screenshot.png")
 
 Record to a video file or a directory of images. The output format is auto-detected from the file extension (`.mp4`, `.mkv`, `.avi`, `.mov`, `.webm` → video, otherwise → image directory). At least one of `duration` or `max_frames` is required.
 
-Recordings use wall-clock timestamps — dropped frames create real time gaps rather than being silently compressed. Video resolution matches the stream automatically.
+Recordings are timestamped from the host's capture clock — dropped frames create real time gaps rather than being silently compressed, so a variable frame rate is recorded faithfully. Video resolution matches the stream automatically.
+
+**Audio** is included automatically when the stream was started with `record_audio=True` (the default):
+- **Video files** get a synced AAC audio track baked into the same container.
+- **Image directories** get a separate `audio.wav` (16-bit PCM) written alongside the frames.
+
+Pass `with_audio=False` to `record()` / `start_recording()` to skip audio for a specific recording.
+
+#### How A/V sync is maintained
+
+Both tracks are placed on the **host's** clock, so they cannot drift apart over a long recording:
+
+- **Video** PTS come from each frame's capture timestamp (moonlight's `presentationTimeUs`), in a 90 kHz time base.
+- **Audio** is positioned at `frame_index × samples_per_frame` — a count of the Opus packets the host generated, not a running total of the samples that happened to arrive.
+
+Because audio is positioned rather than appended, anything lost upstream — a packet dropped by the network, a full queue, a corrupt packet — leaves a **gap filled with silence** instead of pulling all subsequent audio earlier. On stop, the recorder drains audio still in flight (the audio pipeline runs behind video) and pads any remainder with silence so both tracks end together.
+
+Losses are reported at `INFO` level; enable logging to see them:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)
+```
 
 ```python
 # Record 60 seconds of video
@@ -205,6 +234,54 @@ Every frame from `frames()` and `latest_frame()` is a `Frame` dataclass:
 | `height` | `int` | Property: frame height in pixels |
 | `shape` | `tuple` | Property: `data.shape` |
 
+## Audio
+
+When the stream is started with `record_audio=True` (the default), the Opus audio
+stream from Sunshine is decoded to PCM and exposed in real time, mirroring the video
+frame APIs. Audio is 48 kHz; the numpy data is `float32` in the range `[-1.0, 1.0]`.
+
+### Iterating Audio
+
+`audio()` is a generator that yields `AudioChunk` objects:
+
+```python
+with client.stream(app="Desktop"):
+    for chunk in client.audio():
+        # chunk.data — numpy array (samples, channels) float32, 48 kHz
+        process(chunk.data)
+```
+
+### Latest Audio
+
+Like `latest_frame()`, `latest_audio()` always returns the most recent chunk
+(dropping stale ones) — useful when your processing runs slower than real time:
+
+```python
+with client.latest_audio() as buf:
+    while True:
+        chunk = buf.get(timeout=1.0)
+        if chunk is not None:
+            process(chunk.data)
+```
+
+Disable audio entirely with `client.stream(..., record_audio=False)`; then `audio()`
+yields nothing and recordings contain no audio.
+
+### AudioChunk Object
+
+Every chunk from `audio()` and `latest_audio()` is an `AudioChunk` dataclass:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `data` | `np.ndarray` | PCM data, shape `(samples, channels)`, dtype `float32` in `[-1, 1]` |
+| `sample_rate` | `int` | Sample rate in Hz (48000) |
+| `channels` | `int` | Number of audio channels |
+| `timestamp_us` | `int` | Presentation timestamp (microseconds), shared clock with video |
+| `receive_time_us` | `int` | Network receive time (microseconds) |
+| `frame_index` | `int` | Sequential index of the source Opus packet |
+| `num_samples` | `int` | Property: samples per channel |
+| `duration_us` | `int` | Property: chunk duration in microseconds |
+
 ## Setup Reference
 
 ### Discover Servers
@@ -254,7 +331,7 @@ client.quit_app()
 You can use the recorder classes directly for full control over the encoding:
 
 ```python
-from moonlight_python import VideoRecorder, ImageRecorder
+from moonlight_python import VideoRecorder, ImageRecorder, WavRecorder
 
 # Video
 with VideoRecorder("output.mp4", 1920, 1080, fps=30) as rec:
@@ -263,10 +340,29 @@ with VideoRecorder("output.mp4", 1920, 1080, fps=30) as rec:
         if some_condition:
             break
 
+# Video with a synced AAC audio track
+with VideoRecorder("output.mp4", 1920, 1080, fps=30, audio=True) as rec:
+    # pts_us is the capture time in microseconds, relative to the recording
+    # start. Pass frame.timestamp_us - <first frame's timestamp_us>.
+    rec.write(frame, pts_us=elapsed_us)   # from the video thread
+    rec.write_audio(chunk)                # from the audio thread (thread-safe)
+```
+
+`write_audio()` positions each chunk using `chunk.frame_index`, so gaps caused by
+lost audio are filled with silence. If you build `AudioChunk`s yourself and leave
+`frame_index` at its default, chunks are simply appended in order.
+
+```python
+
 # Images
 with ImageRecorder("./captures/", format="png") as rec:
     for frame in client.frames():
         path = rec.write(frame)  # returns Path to saved file
+
+# Audio to WAV
+with WavRecorder("./captures/audio.wav") as rec:
+    for chunk in client.audio():
+        rec.write(chunk)
 ```
 
 ## Examples
@@ -327,9 +423,10 @@ MoonlightClient (high-level API)
 ├── NvHTTP            — GameStream HTTP/HTTPS protocol
 ├── discovery          — mDNS server discovery (zeroconf)
 ├── pairing            — 5-stage cryptographic pairing protocol
-├── StreamingSession  — CFFI bindings to moonlight-common-c
+├── StreamingSession  — CFFI bindings to moonlight-common-c (video + audio callbacks)
 ├── Decoder            — PyAV (FFmpeg) H.264/HEVC/AV1 decoding
-├── StreamManager     — Persistent shared stream with fan-out to subscribers
+├── AudioDecoder      — PyAV (FFmpeg) Opus → float32 PCM decoding
+├── StreamManager     — Persistent shared stream, video + audio fan-out to subscribers
 ├── LatestFrameBuffer — Thread-safe latest-frame buffer
-└── ImageRecorder / VideoRecorder — Recording support
+└── ImageRecorder / VideoRecorder / WavRecorder — Recording support (video, AAC track, WAV)
 ```

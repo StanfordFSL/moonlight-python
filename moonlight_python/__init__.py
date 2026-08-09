@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import atexit
+import logging
 import random
 import secrets
 import threading
@@ -30,6 +31,9 @@ from typing import Iterator
 import numpy as np
 import requests
 
+from .audio_decoder import AudioDecoder
+from .audio_frame import AudioChunk
+from .audio_recorder import WavRecorder
 from .buffer import LatestFrameBuffer
 from .config import CODEC_MAP, StreamConfig, VIDEO_FORMAT_H264
 from .decoder import Decoder
@@ -51,15 +55,38 @@ from .server import AppInfo, ServerInfo
 from ._stream_manager import StreamManager
 from .stream import StreamingSession
 
+log = logging.getLogger(__name__)
+log.addHandler(logging.NullHandler())
+
+# How long to keep pulling in-flight audio after the video loop ends. The audio
+# pipeline (jitter buffer -> raw queue -> decode thread -> subscription queue)
+# runs behind video, so stopping both at once truncates the audio track.
+_AUDIO_DRAIN_TIMEOUT = 2.0
+# Treat the queue as drained after this long with nothing arriving.
+_AUDIO_DRAIN_IDLE = 0.25
+# Consecutive write failures tolerated before the feeder gives up.
+_AUDIO_MAX_ERRORS = 10
+
+try:
+    from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+    __version__ = _pkg_version("moonlight-python")
+except PackageNotFoundError:  # running from a bare source tree, not installed
+    __version__ = "0.0.0+unknown"
+
 __all__ = [
+    "__version__",
     "MoonlightClient",
     "ServerInfo",
     "AppInfo",
     "StreamConfig",
     "Frame",
+    "AudioChunk",
     "LatestFrameBuffer",
     "ImageRecorder",
     "VideoRecorder",
+    "WavRecorder",
+    "AudioDecoder",
     "MoonlightError",
     "PairingError",
     "StreamingError",
@@ -118,6 +145,48 @@ class _SharedLatestFrameBuffer:
         self.stop()
 
 
+class _SharedLatestAudioBuffer:
+    """Latest-audio-chunk reader over a StreamManager (drops stale chunks)."""
+
+    def __init__(self, manager: StreamManager) -> None:
+        self._manager = manager
+
+    def start(self) -> None:
+        """No-op — stream is already running."""
+
+    def stop(self) -> None:
+        """No-op — stream lifecycle managed by stop_stream()."""
+
+    def get(self, timeout: float | None = None) -> "AudioChunk | None":
+        """Poll the shared stream's latest audio chunk.
+
+        Args:
+            timeout: Max seconds to wait for a chunk.
+
+        Returns:
+            The most recent AudioChunk, or None if timeout expired.
+        """
+        if timeout is None:
+            timeout = 30.0
+        if timeout == 0:
+            return self._manager.latest_audio
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            chunk = self._manager.latest_audio
+            if chunk is not None:
+                return chunk
+            time.sleep(0.005)
+        return self._manager.latest_audio
+
+    def __enter__(self) -> _SharedLatestAudioBuffer:
+        self.start()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.stop()
+
+
 class MoonlightClient:
     """High-level client for Moonlight/Sunshine streaming."""
 
@@ -131,6 +200,7 @@ class MoonlightClient:
         self._recording_thread: threading.Thread | None = None
         self._recording_stop: threading.Event | None = None
         self._recording_sub = None
+        self._recording_audio_sub = None
         self._recording_error: BaseException | None = None
 
         # Register cleanup
@@ -269,9 +339,47 @@ class MoonlightClient:
         self._require_stream("latest_frame")
         return _SharedLatestFrameBuffer(self._stream_manager)
 
+    def audio(self) -> Iterator[AudioChunk]:
+        """Yield decoded PCM audio chunks from the active stream.
+
+        Requires an active stream started with ``record_audio=True`` (the
+        default). If audio capture is disabled, this yields nothing.
+
+        Yields:
+            AudioChunk objects with .data as (samples, channels) float32 PCM.
+        """
+        self._require_stream("audio")
+        if not self._stream_manager.has_audio:
+            return
+        sub = self._stream_manager.subscribe_audio()
+        try:
+            yield from sub
+        finally:
+            self._stream_manager.unsubscribe_audio(sub)
+
+    def latest_audio(self) -> _SharedLatestAudioBuffer:
+        """Return a latest-audio-chunk reader for the active stream.
+
+        Requires an active stream started with ``record_audio=True``.
+
+        Usage::
+
+            with client.latest_audio() as buf:
+                while True:
+                    chunk = buf.get(timeout=1.0)
+                    if chunk is not None:
+                        process(chunk.data)
+
+        Returns:
+            _SharedLatestAudioBuffer (use as context manager)
+        """
+        self._require_stream("latest_audio")
+        return _SharedLatestAudioBuffer(self._stream_manager)
+
     def record(self, output: str | Path,
                duration: float | None = None,
-               max_frames: int | None = None) -> None:
+               max_frames: int | None = None,
+               with_audio: bool | None = None) -> None:
         """Record from the active stream to a video file or directory of images.
 
         Requires an active stream via start_stream(). Auto-detects mode
@@ -282,10 +390,16 @@ class MoonlightClient:
         Recordings use wall-clock timestamps — dropped frames create real
         time gaps rather than being silently compressed.
 
+        If the active stream was started with ``record_audio=True`` (the
+        default), audio is included automatically: baked into video files as a
+        synced AAC track, or written to ``<dir>/audio.wav`` for image dirs.
+
         Args:
             output: Output file path or directory.
             duration: Max recording duration in seconds.
             max_frames: Max number of frames to record.
+            with_audio: Override audio inclusion. None (default) includes audio
+                iff the stream captured it; False disables it explicitly.
 
         At least one of duration or max_frames must be provided.
         Use start_recording() / stop_recording() for open-ended recording.
@@ -302,15 +416,23 @@ class MoonlightClient:
         video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
         is_video = output_path.suffix.lower() in video_extensions
 
+        use_audio = self._resolve_with_audio(with_audio)
         first_frame = self._stream_manager.latest_frame
         sub = self._stream_manager.subscribe()
+        audio_sub = self._stream_manager.subscribe_audio() if use_audio else None
         try:
             self._record_from_frames(
                 sub, output_path, is_video, fps,
                 duration, max_frames, first_frame=first_frame,
+                audio_sub=audio_sub,
+                sample_rate=self._stream_manager.audio_sample_rate,
+                channels=self._stream_manager.audio_channels,
+                samples_per_frame=self._stream_manager.audio_samples_per_frame,
             )
         finally:
             self._stream_manager.unsubscribe(sub)
+            if audio_sub is not None:
+                self._stream_manager.unsubscribe_audio(audio_sub)
 
     def _record_from_frames(
         self,
@@ -322,44 +444,162 @@ class MoonlightClient:
         max_frames: int | None,
         first_frame: Frame | None = None,
         stop_event: threading.Event | None = None,
+        audio_sub=None,
+        sample_rate: int = 48000,
+        channels: int = 2,
+        samples_per_frame: int = 0,
     ) -> None:
-        """Record frames from any iterator to the given output path."""
+        """Record frames from any iterator to the given output path.
+
+        When ``audio_sub`` is provided, a companion feeder thread drains
+        decoded audio chunks in parallel: into the video container as an AAC
+        track (video mode), or into ``<dir>/audio.wav`` (image mode).
+
+        Video is timestamped from each frame's capture time and audio from the
+        host's Opus packet count, so the two tracks share the host's clock and
+        cannot drift apart. When the video loop ends, the feeder is given a
+        bounded window to flush audio that is still in flight rather than being
+        killed outright.
+        """
         count = 0
-        start_time = time.monotonic()
+        start_time = time.perf_counter()
+        video_epoch_us: int | None = None
         recorder = None
+        wav = None
+        audio_stop = threading.Event()   # hard kill
+        audio_drain = threading.Event()  # video finished; flush what is left
+        audio_thread: threading.Thread | None = None
+        use_audio = audio_sub is not None
 
         def _open_recorder(frame: Frame):
             if is_video:
                 h, w = frame.data.shape[:2]
-                return VideoRecorder(output_path, w, h, fps)
+                return VideoRecorder(output_path, w, h, fps, audio=use_audio,
+                                     sample_rate=sample_rate, channels=channels,
+                                     samples_per_frame=samples_per_frame)
             return ImageRecorder(output_path)
+
+        def _audio_feed(target, is_wav: bool) -> None:
+            errors = 0
+            idle_since: float | None = None
+            deadline: float | None = None
+            while not audio_stop.is_set():
+                if audio_drain.is_set() and deadline is None:
+                    deadline = time.perf_counter() + _AUDIO_DRAIN_TIMEOUT
+                chunk = audio_sub.get(timeout=0.1)
+                if chunk is None:
+                    if not audio_drain.is_set():
+                        continue
+                    if getattr(audio_sub, "is_closed", False):
+                        return
+                    now = time.perf_counter()
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= _AUDIO_DRAIN_IDLE or now > deadline:
+                        return
+                    continue
+                idle_since = None
+                try:
+                    if is_wav:
+                        target.write(chunk)
+                    else:
+                        target.write_audio(chunk)
+                    errors = 0
+                except Exception:
+                    errors += 1
+                    log.exception("Audio write failed at frame_index=%s",
+                                  getattr(chunk, "frame_index", "?"))
+                    if errors >= _AUDIO_MAX_ERRORS:
+                        log.error("Giving up on audio after %d consecutive failures",
+                                  errors)
+                        return
+                # Once the video has stopped, there is no point pulling audio
+                # past the end of the video timeline.
+                if (audio_drain.is_set() and not is_wav
+                        and target.audio_position_us >= target.last_video_us):
+                    return
+
+        def _start_audio_feeder() -> None:
+            nonlocal audio_thread, wav
+            if not use_audio or audio_thread is not None:
+                return
+            # Discard anything the subscription buffered before the recording
+            # started — up to a second of stale audio that would otherwise be
+            # laid down at PTS 0 and make audio lead video for the whole file.
+            while audio_sub.get(timeout=0.0) is not None:
+                pass
+            if is_video:
+                audio_thread = threading.Thread(
+                    target=_audio_feed, args=(recorder, False), daemon=True)
+            else:
+                wav = WavRecorder(output_path / "audio.wav", sample_rate, channels,
+                                  samples_per_frame=samples_per_frame)
+                audio_thread = threading.Thread(
+                    target=_audio_feed, args=(wav, True), daemon=True)
+            audio_thread.start()
+
+        def _video_pts_us(frame: Frame) -> int:
+            """Capture-relative PTS in microseconds, from the host's clock.
+
+            ``Frame.timestamp_us`` is moonlight's ``presentationTimeUs``, whose
+            epoch is the first captured frame of the session. Using it instead of
+            the time this thread happened to dequeue the frame keeps encoder
+            backlog from showing up as a stretched video timeline.
+            """
+            nonlocal video_epoch_us
+            ts = frame.timestamp_us
+            if video_epoch_us is None:
+                video_epoch_us = ts
+                return 0
+            if ts > video_epoch_us:
+                return ts - video_epoch_us
+            # No usable host PTS for this frame (moonlight leaves it zero when it
+            # has nothing to synthesize from) — fall back to the local clock.
+            return int((time.perf_counter() - start_time) * 1_000_000)
 
         try:
             # Write the latest frame as the first frame (avoids black start)
             if first_frame is not None:
                 recorder = _open_recorder(first_frame)
                 if is_video:
-                    recorder.write(first_frame, pts=0)
+                    # Anchor the video timeline here; later frames are measured
+                    # against this frame's capture time.
+                    video_epoch_us = first_frame.timestamp_us
+                    recorder.write(first_frame, pts_us=0)
                 else:
                     recorder.write(first_frame)
                 count += 1
+                _start_audio_feeder()
 
             for frame in frames:
                 if stop_event is not None and stop_event.is_set():
                     break
                 if recorder is None:
                     recorder = _open_recorder(frame)
+                    _start_audio_feeder()
                 if is_video:
-                    elapsed_ms = int((time.monotonic() - start_time) * 1000)
-                    recorder.write(frame, pts=elapsed_ms)
+                    recorder.write(frame, pts_us=_video_pts_us(frame))
                 else:
                     recorder.write(frame)
                 count += 1
                 if max_frames is not None and count >= max_frames:
                     break
-                if duration is not None and (time.monotonic() - start_time) >= duration:
+                if duration is not None and (time.perf_counter() - start_time) >= duration:
                     break
         finally:
+            # Let the feeder flush in-flight audio before tearing down, so the
+            # recording does not end with video that has no audio under it.
+            if audio_thread is not None:
+                audio_drain.set()
+                audio_thread.join(timeout=_AUDIO_DRAIN_TIMEOUT + 1.0)
+                if audio_thread.is_alive():
+                    log.warning("Audio feeder did not drain within %.1fs; "
+                                "the tail will be padded with silence",
+                                _AUDIO_DRAIN_TIMEOUT)
+                    audio_stop.set()
+                    audio_thread.join(timeout=2.0)
+            if wav is not None:
+                wav.close()
             if recorder is not None:
                 recorder.close()
 
@@ -368,7 +608,8 @@ class MoonlightClient:
                      bitrate_kbps: int = 10000, codec: str = "h264",
                      output_format: str = "bgr24",
                      ready_timeout: float = 10.0,
-                     black_frame_threshold: float = 5.0) -> None:
+                     black_frame_threshold: float = 5.0,
+                     record_audio: bool = True) -> None:
         """Start a persistent shared stream. Blocks until real frames flow.
 
         After calling this, stream(), record(), and latest_frame() will all
@@ -384,15 +625,18 @@ class MoonlightClient:
             output_format: Pixel format — "bgr24" (default) or "rgb24"
             ready_timeout: Max seconds to wait for non-black frames
             black_frame_threshold: Mean pixel value threshold for real frames
+            record_audio: Capture the audio stream (default True). Enables
+                audio() / latest_audio() and audio in record().
         """
         if self._stream_manager is not None and self._stream_manager.is_running:
             raise StreamingError("Stream already active. Call stop_stream() first.")
 
         session, decoder = self._setup_stream(
             app, width, height, fps, bitrate_kbps, codec, output_format,
+            record_audio=record_audio,
         )
 
-        manager = StreamManager(session, decoder, fps)
+        manager = StreamManager(session, decoder, fps, capture_audio=record_audio)
         try:
             manager.start(ready_timeout=ready_timeout,
                           black_frame_threshold=black_frame_threshold)
@@ -427,14 +671,18 @@ class MoonlightClient:
         Image.fromarray(rgb).save(output_path)
         return output_path
 
-    def start_recording(self, output: str | Path) -> None:
+    def start_recording(self, output: str | Path,
+                         with_audio: bool | None = None) -> None:
         """Start background recording to a video file or image directory.
 
         Requires an active stream via start_stream(). Recording runs in
-        a background thread until stop_recording() is called.
+        a background thread until stop_recording() is called. Audio is included
+        automatically when the stream captured it (see record()).
 
         Args:
             output: Output file path (.mp4, .mkv, etc.) or directory for images.
+            with_audio: Override audio inclusion. None (default) includes audio
+                iff the stream captured it; False disables it explicitly.
         """
         self._require_stream("start_recording")
         if self._recording_thread is not None:
@@ -447,10 +695,16 @@ class MoonlightClient:
         video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
         is_video = output_path.suffix.lower() in video_extensions
 
+        use_audio = self._resolve_with_audio(with_audio)
         first_frame = self._stream_manager.latest_frame
         sub = self._stream_manager.subscribe()
+        audio_sub = self._stream_manager.subscribe_audio() if use_audio else None
+        sample_rate = self._stream_manager.audio_sample_rate
+        channels = self._stream_manager.audio_channels
+        samples_per_frame = self._stream_manager.audio_samples_per_frame
         self._recording_stop = threading.Event()
         self._recording_sub = sub
+        self._recording_audio_sub = audio_sub
         self._recording_error: BaseException | None = None
 
         def _record() -> None:
@@ -460,6 +714,10 @@ class MoonlightClient:
                     duration=None, max_frames=None,
                     first_frame=first_frame,
                     stop_event=self._recording_stop,
+                    audio_sub=audio_sub,
+                    sample_rate=sample_rate,
+                    channels=channels,
+                    samples_per_frame=samples_per_frame,
                 )
             except Exception as exc:
                 self._recording_error = exc
@@ -476,6 +734,9 @@ class MoonlightClient:
         if self._recording_sub is not None:
             self._stream_manager.unsubscribe(self._recording_sub)
             self._recording_sub = None
+        if self._recording_audio_sub is not None:
+            self._stream_manager.unsubscribe_audio(self._recording_audio_sub)
+            self._recording_audio_sub = None
         self._recording_thread = None
         if self._recording_error is not None:
             err = self._recording_error
@@ -498,6 +759,7 @@ class MoonlightClient:
     def _setup_stream(self, app: str, width: int, height: int, fps: int,
                       bitrate_kbps: int, codec: str,
                       output_format: str = "bgr24",
+                      record_audio: bool = True,
                       ) -> tuple[StreamingSession, Decoder]:
         """Set up a streaming session and decoder.
 
@@ -585,6 +847,7 @@ class MoonlightClient:
             config=config,
             ri_aes_key=ri_aes_key,
             ri_aes_iv=ri_aes_iv,
+            capture_audio=record_audio,
         )
 
         self._session = session
@@ -600,7 +863,8 @@ class MoonlightClient:
                bitrate_kbps: int = 10000, codec: str = "h264",
                output_format: str = "bgr24",
                ready_timeout: float = 10.0,
-               black_frame_threshold: float = 5.0):
+               black_frame_threshold: float = 5.0,
+               record_audio: bool = True):
         """Context manager for start_stream() / stop_stream().
 
         Usage::
@@ -622,6 +886,7 @@ class MoonlightClient:
                 output_format=output_format,
                 ready_timeout=ready_timeout,
                 black_frame_threshold=black_frame_threshold,
+                record_audio=record_audio,
             )
             try:
                 yield self
@@ -636,6 +901,18 @@ class MoonlightClient:
             raise StreamNotActiveError(
                 f"{method}() requires an active stream. Call start_stream() first."
             )
+
+    def _resolve_with_audio(self, with_audio: bool | None) -> bool:
+        """Decide whether a recording should include audio.
+
+        Audio can only be recorded if the stream captured it. When with_audio
+        is None, include audio iff available; otherwise honor the request but
+        still clamp to availability.
+        """
+        available = self._stream_manager.has_audio
+        if with_audio is None:
+            return available
+        return with_audio and available
 
     def _get_http(self, server: ServerInfo | None = None) -> NvHTTP:
         if server is not None:

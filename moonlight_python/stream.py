@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import queue
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -81,12 +83,18 @@ typedef struct _DECODER_RENDERER_CALLBACKS {
     int capabilities;
 } DECODER_RENDERER_CALLBACKS;
 
+typedef int(*AudioRendererInit)(int audioConfiguration, const OPUS_MULTISTREAM_CONFIGURATION* opusConfig, void* context, int arFlags);
+typedef void(*AudioRendererStart)(void);
+typedef void(*AudioRendererStop)(void);
+typedef void(*AudioRendererCleanup)(void);
+typedef void(*AudioRendererDecodeAndPlaySample)(char* sampleData, int sampleLength);
+
 typedef struct _AUDIO_RENDERER_CALLBACKS {
-    void* init;
-    void* start;
-    void* stop;
-    void* cleanup;
-    void* decodeAndPlaySample;
+    AudioRendererInit init;
+    AudioRendererStart start;
+    AudioRendererStop stop;
+    AudioRendererCleanup cleanup;
+    AudioRendererDecodeAndPlaySample decodeAndPlaySample;
     int capabilities;
 } AUDIO_RENDERER_CALLBACKS;
 
@@ -174,6 +182,27 @@ class RawFrame:
     host_processing_latency_us: int
 
 
+@dataclass(slots=True)
+class RawAudioPacket:
+    """A raw (decrypted) Opus audio packet delivered by moonlight-common-c."""
+
+    opus_data: bytes
+    frame_index: int
+    receive_time_us: int
+
+
+@dataclass
+class OpusConfig:
+    """Negotiated Opus configuration captured from the audio init callback."""
+
+    sample_rate: int = 48000
+    channel_count: int = 2
+    streams: int = 1
+    coupled_streams: int = 1
+    samples_per_frame: int = 240
+    mapping: list = field(default_factory=lambda: [0, 1])
+
+
 def _find_shared_lib() -> str:
     """Find the moonlight-common-c shared library."""
     # Check alongside this module first (installed via scikit-build)
@@ -226,6 +255,16 @@ class StreamingSession:
         # Keep references to callbacks to prevent GC
         self._callbacks: list = []
 
+        # Audio capture state
+        self._capture_audio = False
+        self._audio_queue: "queue.Queue[RawAudioPacket | None] | None" = None
+        self._audio_frame_index = 0
+        self._audio_lost_packets = 0
+        self._audio_dropped_packets = 0
+        self._audio_callback_errors = 0
+        self.opus_config: OpusConfig | None = None
+        self._opus_config_event = threading.Event()
+
     def _make_connection_callbacks(self) -> "cffi.FFI.CData":
         """Create CONNECTION_LISTENER_CALLBACKS with our handlers."""
         cl = self._ffi.new("CONNECTION_LISTENER_CALLBACKS*")
@@ -273,24 +312,164 @@ class StreamingSession:
         # All function pointers stay NULL — pull mode doesn't use them
         return dr
 
-    def _make_audio_callbacks(self) -> "cffi.FFI.CData":
-        """Create no-op AUDIO_RENDERER_CALLBACKS (discard audio)."""
+    def _make_audio_callbacks(self, capture_audio: bool = False) -> "cffi.FFI.CData":
+        """Create AUDIO_RENDERER_CALLBACKS.
+
+        When ``capture_audio`` is False (default), returns a no-op renderer so
+        the audio stream is negotiated but discarded (zero overhead). When True,
+        installs real callbacks that capture the negotiated Opus configuration
+        and forward each decrypted Opus packet to an internal queue for
+        decoding on a separate thread.
+        """
         ar = self._ffi.new("AUDIO_RENDERER_CALLBACKS*")
         self._lib.LiInitializeAudioCallbacks(ar)
         ar.capabilities = CAPABILITY_DIRECT_SUBMIT  # Direct submit to avoid queuing
+
+        if not capture_audio:
+            # Leave all function pointers NULL — moonlight-common-c substitutes
+            # no-op fake callbacks and the audio is discarded.
+            return ar
+
+        self._audio_queue = queue.Queue(maxsize=512)
+        self._audio_frame_index = 0
+
+        @self._ffi.callback("int(int, OPUS_MULTISTREAM_CONFIGURATION*, void*, int)")
+        def audio_init(audio_configuration, opus_config, context, ar_flags):  # noqa: ANN001
+            try:
+                oc = opus_config
+                self.opus_config = OpusConfig(
+                    sample_rate=oc.sampleRate,
+                    channel_count=oc.channelCount,
+                    streams=oc.streams,
+                    coupled_streams=oc.coupledStreams,
+                    samples_per_frame=oc.samplesPerFrame,
+                    mapping=[oc.mapping[i] for i in range(oc.channelCount)],
+                )
+            except Exception:
+                # Never propagate a Python exception into C; fall back to defaults.
+                self.opus_config = OpusConfig()
+            finally:
+                self._opus_config_event.set()
+            return 0
+
+        @self._ffi.callback("void(void)")
+        def audio_start():
+            pass
+
+        @self._ffi.callback("void(void)")
+        def audio_stop():
+            pass
+
+        @self._ffi.callback("void(void)")
+        def audio_cleanup():
+            pass
+
+        @self._ffi.callback("void(char*, int)")
+        def audio_decode_and_play(sample_data, sample_length):  # noqa: ANN001
+            # Runs on the RTP receive thread — keep minimal, never block, and
+            # never raise into C. Copy the buffer immediately (it is only valid
+            # for the duration of this call), then hand off.
+            try:
+                # sample_length <= 0 is moonlight-common-c's packet-loss signal,
+                # and sample_data is NULL in that case, so test the length first.
+                if sample_length <= 0:
+                    self._on_audio_sample(None)
+                else:
+                    self._on_audio_sample(
+                        bytes(self._ffi.buffer(sample_data, sample_length))
+                    )
+            except Exception:
+                self._audio_callback_errors += 1
+
+        self._callbacks.extend(
+            [audio_init, audio_start, audio_stop, audio_cleanup, audio_decode_and_play]
+        )
+
+        ar.init = audio_init
+        ar.start = audio_start
+        ar.stop = audio_stop
+        ar.cleanup = audio_cleanup
+        ar.decodeAndPlaySample = audio_decode_and_play
+
         return ar
+
+    def _on_audio_sample(self, data: bytes | None) -> None:
+        """Ingest one audio packet. Called from the CFFI callback.
+
+        ``data is None`` is moonlight-common-c's packet-loss-concealment signal
+        (``decodeAndPlaySample(NULL, 0)``, AudioStream.c). PyAV exposes no way to
+        run real Opus PLC — a zero-length packet means *drain* to avcodec, not
+        *conceal* — so no PCM is produced. The frame index must still advance:
+        it is the audio timeline, and skipping it would delete the lost packet's
+        duration from the recording and pull all later audio earlier. Consumers
+        see the resulting index gap and fill it with silence.
+        """
+        if self._audio_queue is None:
+            return
+        index = self._audio_frame_index
+        self._audio_frame_index += 1
+        if data is None:
+            self._audio_lost_packets += 1
+            return
+        self._enqueue_audio(RawAudioPacket(
+            opus_data=data,
+            frame_index=index,
+            receive_time_us=int(time.perf_counter() * 1_000_000),
+        ))
+
+    def _enqueue_audio(self, pkt: "RawAudioPacket") -> None:
+        """Enqueue an audio packet, dropping the oldest on overflow.
+
+        A dropped packet leaves a gap in the ``frame_index`` sequence that
+        downstream consumers fill with silence, so overflow costs audio content
+        but never shifts the audio timeline.
+        """
+        q = self._audio_queue
+        if q is None:
+            return
+        try:
+            q.put_nowait(pkt)
+        except queue.Full:
+            self._audio_dropped_packets += 1
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(pkt)
+            except queue.Full:
+                pass
+
+    @property
+    def audio_loss_stats(self) -> dict[str, int]:
+        """Counts of audio packets that never reached the decoder."""
+        return {
+            "lost": self._audio_lost_packets,        # missing on the network
+            "dropped": self._audio_dropped_packets,  # queue overflow
+            "callback_errors": self._audio_callback_errors,
+        }
 
     def start(self, address: str, app_version: str, gfe_version: str,
               server_codec_mode_support: int, rtsp_session_url: str,
-              config: StreamConfig, ri_aes_key: bytes, ri_aes_iv: bytes) -> None:
-        """Start the streaming connection."""
+              config: StreamConfig, ri_aes_key: bytes, ri_aes_iv: bytes,
+              capture_audio: bool = False) -> None:
+        """Start the streaming connection.
+
+        Args:
+            capture_audio: If True, install real audio callbacks that forward
+                decrypted Opus packets for decoding. If False, audio is
+                negotiated but discarded (default).
+        """
         if self._connected:
             raise RuntimeError("Already connected")
+
+        self._capture_audio = capture_audio
 
         # Reset state
         self._connection_started.clear()
         self._connection_terminated.clear()
         self._stage_failed.clear()
+        self._opus_config_event.clear()
 
         # Server information
         si = self._ffi.new("SERVER_INFORMATION*")
@@ -336,7 +515,7 @@ class StreamingSession:
         # Callbacks
         cl = self._make_connection_callbacks()
         dr = self._make_video_callbacks()
-        ar = self._make_audio_callbacks()
+        ar = self._make_audio_callbacks(capture_audio=capture_audio)
 
         # Keep structs alive
         self._si = si
@@ -441,6 +620,39 @@ class StreamingSession:
     def wake(self) -> None:
         """Wake up LiWaitForNextVideoFrame() so a blocked pull thread can exit."""
         self._lib.LiWakeWaitForVideoFrame()
+
+    @property
+    def capture_audio(self) -> bool:
+        return self._capture_audio
+
+    def wait_for_opus_config(self, timeout: float = 5.0) -> OpusConfig:
+        """Wait for the negotiated Opus config from the audio init callback.
+
+        Returns the captured config, or a stereo default if it never arrives.
+        """
+        self._opus_config_event.wait(timeout=timeout)
+        return self.opus_config or OpusConfig()
+
+    def pull_audio_packet(self, timeout: float | None = 1.0) -> RawAudioPacket | None:
+        """Pull the next raw Opus packet (blocking up to ``timeout``).
+
+        Returns None on timeout, when audio capture is disabled, or when a
+        wake_audio() sentinel is received.
+        """
+        if self._audio_queue is None:
+            return None
+        try:
+            return self._audio_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def wake_audio(self) -> None:
+        """Push a sentinel so a blocked audio consumer thread can exit."""
+        if self._audio_queue is not None:
+            try:
+                self._audio_queue.put_nowait(None)
+            except queue.Full:
+                pass
 
     @property
     def is_connected(self) -> bool:
